@@ -1,0 +1,62 @@
+> models/map_objects/hoth/light_wallbeam
+  {
+      {
+          map models/map_objects/hoth/light_wallbeam
+          rgbGen lightingDiffuse
+      }
+      {
+          map models/map_objects/hoth/light_wallbeam_glw
+          blendFunc GL_ONE GL_ONE
+          glow
+          rgbGen identity
+      }
+  }
+  
+  models/map_objects/hoth/heater_coil
+  {
+  	q3map_nolightmap
+      {
+          map models/map_objects/hoth/heater_coil
+          rgbGen lightingDiffuse
+      }
+      {
+          map models/map_objects/hoth/heater_coil_glow
+          blendFunc GL_ONE GL_ONE
+          rgbGen wave sawtooth 0 0.5 0 30
+      }
+      {
+          map models/map_objects/hoth/heater_coil_glow
+          blendFunc GL_ONE GL_ONE
+          glow
+          rgbGen wave sawtooth 0 0.5 0.5 30
+> models/map_objects/hoth/light_wallbeam_lens
+  {
+  	q3map_nolightmap
+      {
+          map models/map_objects/hoth/light_wallbeam_lens
+          rgbGen lightingDiffuse
+      }
+      {
+          map models/map_objects/hoth/light_wallbeam_lens_glw
+          blendFunc GL_ONE GL_ONE
+          glow
+          rgbGen wave sawtooth 0 0.3 0 40
+      }
+      {
+          map models/map_objects/hoth/light_wallbeam_lens_glw
+          blendFunc GL_ONE GL_ONE
+          glow
+          rgbGen wave sawtooth 0 0.3 0.5 40
+      }
+  }
+  
+  models/map_objects/hoth/hothhall
+  {
+  // q3map_clipmodel
+  
+  	qer_editorimage	models/map_objects/hoth/hothhall
+  	surfaceparm	nodlight
+  	q3map_nolightmap
+  	q3map_onlyvertexlighting
+      {
+          map models/map_objects/hoth/hothhall

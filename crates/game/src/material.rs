@@ -42,7 +42,7 @@ const SHADER: Handle<Shader> = uuid_handle!("5d0f3b8e-3f7c-4d8e-9a51-0b7c2e61d4a
 const PARTICLES_SHADER: Handle<Shader> = uuid_handle!("a4d81f37-6c2e-4b95-8f03-1e7b9c5d2a68");
 /// `kjk::lighting`, the flash and the fog this material and the grass share.
 const LIGHTING: Handle<Shader> = uuid_handle!("c3a7e215-8d4b-4f6e-b0d2-5e91f7a4c836");
-
+const TCGEN_ENVIRONMENT: u32 = 32768;
 /// The area's lights, which every material reads unless given others.
 pub const AREA_LIGHTS: Handle<ShaderBuffer> = uuid_handle!("b6e2a9d4-71c3-4f08-8e5a-3d9c0f6b2a17");
 
@@ -475,10 +475,13 @@ pub enum Surface {
     /// writes: twice the texture times what is behind, on the encoded
     /// values as the game's framebuffer had them.
     Modulate,
+    /// Transparent pass, `src × dst` (Quake 3 `blendFunc filter`),
+    /// no depth writes.
+    Filter,
 }
 
 impl Surface {
-    pub const ALL: [Surface; 9] = [
+    pub const ALL: [Surface; 10] = [
         Surface::Opaque,
         Surface::OpaqueAlpha,
         Surface::OpaqueEnvMasked,
@@ -488,6 +491,7 @@ impl Surface {
         Surface::BlendVertex,
         Surface::Lighten,
         Surface::Modulate,
+        Surface::Filter,
     ];
 
     pub fn name(self) -> &'static str {
@@ -501,6 +505,7 @@ impl Surface {
             Surface::BlendVertex => "blend_vertex",
             Surface::Lighten => "lighten",
             Surface::Modulate => "modulate",
+            Surface::Filter => "filter",
         }
     }
 }
@@ -698,6 +703,12 @@ impl OdysseyMaterial {
     pub fn recoloured(mut self, colour: [f32; 3]) -> OdysseyMaterial {
         self.params.tint = Vec4::new(colour[0], colour[1], colour[2], self.params.tint.w);
         self.params.flags |= RECOLOUR;
+        self
+    }
+
+    /// Generate Quake 3 `tcGen environment` sphere-map coordinates.
+    pub fn tcgen_environment(mut self) -> OdysseyMaterial {
+        self.params.flags |= TCGEN_ENVIRONMENT;
         self
     }
 
@@ -932,6 +943,7 @@ pub fn writes_depth(surface: Surface) -> bool {
             | Surface::BlendVertex
             | Surface::Lighten
             | Surface::Modulate
+            | Surface::Filter
     )
 }
 
@@ -966,6 +978,18 @@ pub fn blend(surface: Surface) -> Option<BlendState> {
                 operation: BlendOperation::Add,
             },
         }),
+        Surface::Filter => Some(BlendState {
+            color: BlendComponent {
+                src_factor: BlendFactor::Dst,
+                dst_factor: BlendFactor::Zero,
+                operation: BlendOperation::Add,
+            },
+            alpha: BlendComponent {
+                src_factor: BlendFactor::Zero,
+                dst_factor: BlendFactor::One,
+                operation: BlendOperation::Add,
+            },
+        }),
         Surface::Additive | Surface::Lighten => Some(BlendState {
             color: BlendComponent {
                 src_factor: BlendFactor::SrcAlpha,
@@ -990,13 +1014,11 @@ impl Material for OdysseyMaterial {
     /// transparent phase; the blend itself is set in `specialize`.
     fn alpha_mode(&self) -> AlphaMode {
         match self.surface {
-            // Blended opaque surfaces go to the sorted phase as well, with
-            // depth writes kept: xoreos draws its opaque pass far to near,
-            // and Bevy's opaque phase has no fixed order, so blending there
-            // changed from run to run (the tour's Dantooine foliage).
-            Surface::Blend | Surface::OpaqueAlpha | Surface::BlendVertex | Surface::Modulate => {
-                AlphaMode::Blend
-            }
+            Surface::Blend
+            | Surface::OpaqueAlpha
+            | Surface::BlendVertex
+            | Surface::Modulate
+            | Surface::Filter => AlphaMode::Blend,
             Surface::Additive | Surface::AddOne | Surface::Lighten => AlphaMode::Add,
             _ => AlphaMode::Opaque,
         }
@@ -1056,6 +1078,28 @@ impl Material for OdysseyMaterial {
         if let Some(depth) = descriptor.depth_stencil.as_mut() {
             depth.depth_write_enabled = Some(key.depth_write);
         }
+        if key.blend == blend(Surface::AddOne) {
+            let blends: Vec<bool> = descriptor
+                .fragment
+                .as_ref()
+                .map(|fragment| {
+                    fragment
+                        .targets
+                        .iter()
+                        .flatten()
+                        .map(|target| target.blend == key.blend)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            eprintln!(
+                "ADDONE PIPELINE DEBUG: depth_write={} targets={} blend_matches={:?}",
+                key.depth_write,
+                blends.len(),
+                blends
+            );
+        }
+
         Ok(())
     }
 }

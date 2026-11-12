@@ -380,6 +380,7 @@ fn load_with(
                 hook_local: None,
                 clip: clip.clone(),
                 envmap: None,
+                bsp: None,
             });
             models.push(Placed {
                 ir: head,
@@ -391,6 +392,7 @@ fn load_with(
                 hook_local: None,
                 clip,
                 envmap: None,
+                bsp: None,
             });
             // A KOTOR hilt hangs at its weapon node as K1 hangs it; a JA
             // one turned to match (the hand's turn is the same either way).
@@ -418,6 +420,7 @@ fn load_with(
                     hook_local: local,
                     clip: None,
                     envmap: None,
+                    bsp: None,
                 });
                 hilts.push((models.len() - 1, blades, ja, Some((grip.weapon, local))));
             }
@@ -461,6 +464,7 @@ fn load_with(
                 hook_local: None,
                 clip,
                 envmap: None,
+                bsp: None,
             });
             for h in &held {
                 models.push(Placed {
@@ -473,6 +477,7 @@ fn load_with(
                     hook_local: Some(h.bolt.matrix),
                     clip: None,
                     envmap: None,
+                    bsp: None,
                 });
                 hilts.push((models.len() - 1, h.ja_blades.clone(), true, None));
             }
@@ -656,6 +661,7 @@ fn load_with(
                 hook_local: None,
                 clip: None,
                 envmap: None,
+                bsp: None,
             });
             if *ja {
                 flying_ja.push(model);
@@ -745,6 +751,7 @@ fn load_with(
         hook_local: None,
         clip: None,
         envmap: None,
+        bsp: None,
     });
     let scene = LoadedScene {
         name: format!("rig {} {}", options.probe, options.body),

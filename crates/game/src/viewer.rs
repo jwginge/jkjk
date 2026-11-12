@@ -4,8 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use std::sync::Arc;
-
+use asset_ja::bsp::BspVis;
 use asset_odyssey::anim::AnimationIr;
 use asset_odyssey::creature;
 use asset_odyssey::hooks;
@@ -20,6 +19,7 @@ use fmt_odyssey::ResType;
 use fmt_odyssey::bwm::Walkmesh;
 use fmt_odyssey::mdl::Model;
 use fmt_odyssey::txi::Txi;
+use std::sync::Arc;
 use vfs::resolver::Resolver;
 use vfs::{Discovery, Game};
 
@@ -34,27 +34,17 @@ pub struct Placed {
     pub ir: ModelIr,
     pub offset: [f32; 3],
     pub facing: f32,
-    /// Rooms, and doors and placeables marked `Static`: reone lights them
-    /// only with lights of dynamic type 1.
     pub is_static: bool,
-    /// A transform inside the placement, applied first: a head sits at its
-    /// body's `headhook` node (its rest transform).
     pub attach: Option<Matrix>,
-    /// (index of the placed body, its node): the head follows that node as
-    /// the body animates.
     pub hook: Option<(usize, usize)>,
-    /// The model root's transform under the hook node (a saber hilt sits at
-    /// its hand bolt); identity when `None`.
     pub hook_local: Option<Matrix>,
-    /// The clip to loop, with the clips of the model's supermodel chain.
     pub clip: Option<Arc<AnimationIr>>,
-    /// The cube map the object is drawn with where its meshes' textures
-    /// name none (a creature's body and head: `creature::EnvMap`).
     pub envmap: Option<String>,
+    /// BSP PVS and mesh→surface mapping, when this is a converted map.
+    pub bsp: Option<Arc<BspVis>>,
 }
 
 impl Placed {
-    /// `ir` at `offset` (game space), facing +X, lit as a moving thing.
     pub fn at(ir: ModelIr, offset: [f32; 3]) -> Placed {
         Placed {
             ir,
@@ -66,6 +56,7 @@ impl Placed {
             hook_local: None,
             clip: None,
             envmap: None,
+            bsp: None,
         }
     }
 }
@@ -208,6 +199,7 @@ pub struct LoadedScene {
     pub name: String,
     pub models: Vec<Placed>,
     pub textures: BTreeMap<String, TextureIr>,
+    pub ja_shaders: BTreeMap<String, fmt_ja::shader::Shader>,
     /// Texture names the meshes use but the install does not resolve, or
     /// that do not decode (`stand_in` says what is drawn instead).
     pub missing: Vec<String>,
@@ -471,6 +463,7 @@ pub struct Effects {
     pub items: Vec<Effect>,
     /// How each shader the items name blends (its texture is in
     /// `LoadedScene::textures` under the shader's name).
+    pub ja_shaders: BTreeMap<String, fmt_ja::shader::Shader>,
     pub blends: BTreeMap<String, EffectBlend>,
     /// The model a push's or pull's distortion is drawn with (JA's
     /// `models/weaphits/testboom.md3`): positions (units), texture
@@ -995,6 +988,7 @@ pub fn load_model(
         hook_local: None,
         clip: None,
         envmap: None,
+        bsp: None,
     }];
     let (textures, missing) = textures(&resolver, &models);
     Ok(LoadedScene {
@@ -1147,6 +1141,7 @@ pub fn module_scene(
                     hook_local: None,
                     clip: None,
                     envmap: None,
+                    bsp: None,
                 });
                 Some(models.len() - 1)
             }
@@ -1252,6 +1247,7 @@ pub fn module_scene(
                     hook_local: None,
                     clip: None,
                     envmap: None,
+                    bsp: None,
                 });
                 instances += 1;
             }
@@ -1294,6 +1290,7 @@ pub fn module_scene(
     Ok(LoadedScene {
         default_envmap: creatures.default_envmap,
         missing_body_textures: creatures.missing_body_textures,
+        ja_shaders: BTreeMap::new(),
         instances,
         creatures: creatures.placed,
         creature_refusals: creatures.refusals,

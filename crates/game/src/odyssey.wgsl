@@ -111,6 +111,7 @@ struct BoxList {
 }
 
 // Flags: see `material.rs`.
+const TCGEN_ENVIRONMENT: u32 = 32768u;
 const DISCARD_ZERO_ALPHA: u32 = 1u;
 const OPAQUE_ALPHA: u32 = 2u;
 const ENVMAP: u32 = 4u;
@@ -725,10 +726,24 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let moving = animated[params.slot];
     let tint = vec4<f32>(params.tint.rgb, params.tint.a * moving.illum_alpha.a);
 #ifdef VERTEX_UVS_A
-    let uv = in.uv + params.uv_offset + moving.uv.xy;
+    var uv = in.uv + params.uv_offset + moving.uv.xy;
 #else
     let uv = vec2<f32>(0.0);
 #endif
+if (params.flags & TCGEN_ENVIRONMENT) != 0u {
+    let incident = normalize(in.world_position.xyz - view.world_position);
+    let mirrored = reflect(incident, normalize(in.world_normal));
+
+    let eye = mat3x3<f32>(
+        view.view_from_world[0].xyz,
+        view.view_from_world[1].xyz,
+        view.view_from_world[2].xyz
+    );
+
+    let r = eye * mirrored;
+    let m = 2.0 * length(r + vec3<f32>(0.0, 0.0, 1.0));
+    uv = r.xy / max(m, 1e-4) + vec2<f32>(0.5);
+}
 #ifdef VERTEX_UVS_B
     let uv2 = in.uv_b;
 #else

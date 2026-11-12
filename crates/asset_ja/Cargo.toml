@@ -11,6 +11,7 @@ fmt_ja.workspace = true
 asset_odyssey.workspace = true
 collision.workspace = true
 glam.workspace = true
+vfs.workspace = true
 
 [lints]
 workspace = true

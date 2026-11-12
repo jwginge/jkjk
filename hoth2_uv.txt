@@ -1,0 +1,82 @@
+   Compiling asset_ja v0.0.0 (E:\AI\jkjk\crates\asset_ja)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.28s
+     Running unittests src\lib.rs (target\debug\deps\asset_ja-25ae118004c4873d.exe)
+
+running 1 test
+Archive: E:\SteamLibrary\steamapps\common\Jedi Academy\GameData\base\assets0.pk3
+Entry: maps/hoth2.bsp
+BSP bytes: 13970616
+
+Surfaces with SURF_SKY bit set:
+  textures/skies/hoth: flags=0x00182000, surfaces=32
+
+Explicit Hoth sky shader entries:
+  textures/skies/hoth: surface_flags=0x00182000, content_flags=0x00008001
+
+Lightmap slot usage:
+  Slot 0: 3914 surfaces
+  Slot 1: 0 surfaces
+  Slot 2: 0 surfaces
+  Slot 3: 0 surfaces
+
+BSP surface diagnostics:
+  Total surfaces: 7421
+  Planar: 6938
+  Patch: 101
+  Triangle soup: 284
+  Flare: 98
+  Unsupported: 0
+  Empty surfaces: 98
+  Patch control vertices: 2775
+  Estimated tessellated patch vertices: 31581
+
+=== UV scale per shader (planar surfaces) ===
+  textures/skies/hoth: 32 surfaces, 231 verts, avg extent 4083, avg u_span 290.25 (7.11 tiles/100u), avg v_span 184.19 (4.51 tiles/100u)
+  textures/hoth/h_tile_02: 753 surfaces, 5099 verts, avg extent 103, avg u_span 2.26 (2.19 tiles/100u), avg v_span 1.69 (1.64 tiles/100u)
+  textures/hoth/metal_lg_lt_vertex: 826 surfaces, 4035 verts, avg extent 69, avg u_span 1.65 (2.39 tiles/100u), avg v_span 1.43 (2.06 tiles/100u)
+  textures/hoth/basic2_vertex: 528 surfaces, 2927 verts, avg extent 103, avg u_span 0.85 (0.83 tiles/100u), avg v_span 0.60 (0.58 tiles/100u)
+  textures/hoth/metal_lg_dk_vertex: 646 surfaces, 3660 verts, avg extent 71, avg u_span 4.16 (5.87 tiles/100u), avg v_span 1.72 (2.43 tiles/100u)
+  textures/cairn/metalc2: 618 surfaces, 3683 verts, avg extent 59, avg u_span 0.23 (0.38 tiles/100u), avg v_span 0.42 (0.72 tiles/100u)
+  textures/hoth/exit_beam_side: 187 surfaces, 819 verts, avg extent 120, avg u_span 4.70 (3.90 tiles/100u), avg v_span 1.00 (0.83 tiles/100u)
+  textures/hoth/exit_beam: 133 surfaces, 768 verts, avg extent 164, avg u_span 17.68 (10.78 tiles/100u), avg v_span 16.16 (9.85 tiles/100u)
+  textures/hoth/h_basicwall_2: 147 surfaces, 1017 verts, avg extent 140, avg u_span 0.99 (0.71 tiles/100u), avg v_span 0.90 (0.65 tiles/100u)
+  textures/imperial/wall_6: 218 surfaces, 941 verts, avg extent 85, avg u_span 1.75 (2.07 tiles/100u), avg v_span 0.38 (0.45 tiles/100u)
+  textures/common/dark_dust: 166 surfaces, 684 verts, avg extent 110, avg u_span 1.03 (0.93 tiles/100u), avg v_span 1.41 (1.28 tiles/100u)
+  textures/hoth/h_control_metal: 179 surfaces, 804 verts, avg extent 102, avg u_span 1.99 (1.96 tiles/100u), avg v_span 2.72 (2.67 tiles/100u)
+  textures/imp_mine/blastdoor_piece: 178 surfaces, 940 verts, avg extent 82, avg u_span 1.48 (1.79 tiles/100u), avg v_span 1.10 (1.34 tiles/100u)
+  textures/hoth/exit_trim: 121 surfaces, 542 verts, avg extent 115, avg u_span 3.75 (3.26 tiles/100u), avg v_span 0.71 (0.62 tiles/100u)
+  textures/hoth/crate1_vertex: 202 surfaces, 868 verts, avg extent 66, avg u_span 1.02 (1.54 tiles/100u), avg v_span 1.02 (1.53 tiles/100u)
+  textures/hoth/exit_plate: 191 surfaces, 986 verts, avg extent 70, avg u_span 1.07 (1.52 tiles/100u), avg v_span 1.15 (1.64 tiles/100u)
+  textures/hoth/h_wall_03: 46 surfaces, 279 verts, avg extent 277, avg u_span 1.79 (0.65 tiles/100u), avg v_span 0.77 (0.28 tiles/100u)
+  textures/hoth/trim_01: 92 surfaces, 540 verts, avg extent 130, avg u_span 1.31 (1.00 tiles/100u), avg v_span 6.60 (5.08 tiles/100u)
+  textures/hoth/h_tile: 183 surfaces, 1013 verts, avg extent 61, avg u_span 3.43 (5.62 tiles/100u), avg v_span 4.12 (6.76 tiles/100u)
+  textures/hoth/floorpanel_01_vertex: 132 surfaces, 661 verts, avg extent 76, avg u_span 0.67 (0.88 tiles/100u), avg v_span 0.50 (0.65 tiles/100u)
+=== end UV scale ===
+
+
+Lightmap UV diagnostics:
+  Lightmapped meshes: 3871
+  UV2 coordinates: 36143
+  Out-of-range UV2 coordinates: 0
+
+Converted model:
+  Meshes: 7323
+  Vertices: 83406
+  Indices: 277458
+  Lightmaps: 11
+
+Actual conversion diagnostics:
+  Total surfaces: 7421
+  Planar converted: 6938
+  Patches converted: 101
+  Triangle soup converted: 284
+  Flares skipped: 98
+  Empty surfaces skipped: 0
+  Actual patch vertices: 31581
+  Actual patch indices: 166272
+  Meshes with lightmaps: 3871
+
+test bsp::tests::real_map_test::real_map ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.39s
+
