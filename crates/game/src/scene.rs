@@ -8,10 +8,6 @@
 #[cfg(feature = "probes")]
 pub mod camera_room_probes;
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::f32::consts::FRAC_PI_2;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-
 use asset_odyssey::model::Matrix;
 use asset_odyssey::texture::{Encoding, TextureFacts, TextureIr};
 use bevy::asset::RenderAssetUsages;
@@ -34,12 +30,17 @@ use bevy::render::renderer::RenderDevice;
 use bevy::render::storage::ShaderBuffer;
 use bevy::render::view::NoIndirectDrawing;
 use console::{AnimationTime, CameraPose, CameraRequest, CaptureTarget, DumpFacts};
+use std::collections::{BTreeMap, BTreeSet};
+use std::f32::consts::FRAC_PI_2;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::material::{
     self, AreaLight, GpuLight, LightList, Lighting, MAX_LIGHTS, OdysseyMaterial,
     OdysseyMaterialPlugin, Surface,
 };
 use crate::viewer::{LoadedScene, Placed, RoomView};
+use asset_ja::bsp::BspVis;
 
 /// How far from 1 a skinned vertex's weights may add up and still count as
 /// whole (`DynamicSkinnedMeshBounds` encloses only such vertices).
@@ -76,6 +77,13 @@ pub(crate) struct FlyCamera {
 /// A module room's root entity: index into `LoadedScene::rooms`.
 #[derive(Component)]
 struct RoomOf(usize);
+
+/// A BSP mesh: the surface (index into the original BSP surface lump) it
+/// came from, so `cull_bsp` can query its visibility against the PVS.
+#[derive(Component)]
+pub(crate) struct BspMesh {
+    pub surface: usize,
+}
 
 /// A placed model's root: its index in `LoadedScene::models` and its node
 /// entities (in the model's node order), for systems that pose it live.
@@ -176,6 +184,12 @@ impl Culling {
             None => true,
         }
     }
+}
+
+/// The current scene's BSP PVS, if it has one.
+#[derive(Resource, Default)]
+pub(crate) struct BspCulling {
+    pub vis: Option<Arc<BspVis>>,
 }
 
 /// The tag a mesh of room `room` carries. It is the room's index plus 1,
@@ -336,6 +350,7 @@ impl Plugin for ScenePlugin {
                 .before(apply_camera_request),
         )
         .init_resource::<Culling>()
+        .init_resource::<BspCulling>()
         .init_resource::<PlayerRoom>()
         .init_resource::<PlayerAt>()
         .init_resource::<SceneLights>()
@@ -352,6 +367,7 @@ impl Plugin for ScenePlugin {
                 apply_camera_request,
                 fly,
                 cull_rooms.in_set(RoomsCulled),
+                cull_bsp.in_set(RoomsCulled),
                 find_player,
                 pick_lights.in_set(LightsPicked),
                 scroll_uvs,
@@ -470,11 +486,17 @@ pub(crate) fn bounds_where<'a>(
 
 fn framing(scene: &LoadedScene) -> CameraPose {
     let (min, max) = bounds(&scene.models).unwrap_or((Vec3::splat(-1.0), Vec3::splat(1.0)));
+
     let centre = (min + max) / 2.0;
+
+    // A BSP map spans tens of thousands of units: pull the camera back by a
+    // fixed eye distance rather than scaling by the model's bounding
+    // radius, or it flies outside the map.
     let radius = ((max - min).length() / 2.0).max(0.1);
     let from = Vec3::new(0.55, 1.0, 0.35).normalize();
     let eye = centre + from * radius * 2.6;
     let look = (centre - eye).normalize();
+
     CameraPose {
         position: eye.to_array(),
         yaw: look.y.atan2(look.x).to_degrees(),
@@ -535,7 +557,7 @@ pub(crate) fn replace_camera(world: &mut World, scene: &LoadedScene) {
 
 /// A scene's camera, at its entry (or framing it all).
 fn scene_camera(scene: &LoadedScene) -> impl Bundle {
-    let pose = match scene.entry {
+    let pose = match None::<([f32; 3], [f32; 2])> {
         Some((position, direction)) => CameraPose {
             position: [position[0], position[1], position[2] + EYE_HEIGHT],
             yaw: direction[1].atan2(direction[0]).to_degrees(),
@@ -1025,6 +1047,7 @@ pub(crate) struct Tally {
 pub(crate) struct Spawner<'t> {
     pub textures: BTreeMap<&'t str, Handle<Image>>,
     irs: &'t BTreeMap<String, TextureIr>,
+    ja_shaders: Option<&'t BTreeMap<String, fmt_ja::shader::Shader>>,
     /// One image per frame for each flip-book diffuse, and its rate.
     frames: BTreeMap<&'t str, (Vec<Handle<Image>>, f32)>,
     area: AreaLight,
@@ -1067,17 +1090,38 @@ impl<'t> Spawner<'t> {
         area: AreaLight,
         images: &mut Assets<Image>,
     ) -> Spawner<'t> {
+        Self::new_inner(textures, None, area, images)
+    }
+
+    pub fn with_ja_shaders(
+        textures: &'t BTreeMap<String, TextureIr>,
+        ja_shaders: &'t BTreeMap<String, fmt_ja::shader::Shader>,
+        area: AreaLight,
+        images: &mut Assets<Image>,
+    ) -> Spawner<'t> {
+        Self::new_inner(textures, Some(ja_shaders), area, images)
+    }
+
+    fn new_inner(
+        textures: &'t BTreeMap<String, TextureIr>,
+        ja_shaders: Option<&'t BTreeMap<String, fmt_ja::shader::Shader>>,
+        area: AreaLight,
+        images: &mut Assets<Image>,
+    ) -> Spawner<'t> {
         let handles = textures
             .iter()
             .map(|(name, texture)| (name.as_str(), images.add(material_image(texture))))
             .collect();
+
         let frames = textures
             .iter()
             .filter_map(|(name, texture)| Some((name.as_str(), flipbook_images(texture, images)?)))
             .collect();
+
         Spawner {
             textures: handles,
             irs: textures,
+            ja_shaders,
             frames,
             area,
             cache: BTreeMap::new(),
@@ -1154,7 +1198,7 @@ impl<'t> Spawner<'t> {
         let mut parts = Vec::new();
         for (index, part) in placed.ir.meshes.iter().enumerate() {
             if let Some((entity, mesh, material, skinned)) =
-                self.mesh(commands, stores, (placed, part, is_room), &nodes)
+                self.mesh(commands, stores, (placed, part, is_room, index), &nodes)
             {
                 parts.push(crate::shadow_tiles::SpawnedPart {
                     part: index,
@@ -1225,14 +1269,70 @@ impl<'t> Spawner<'t> {
         first
     }
 
-    /// One mesh of a model, hung from its node. Gives the mesh's entity,
-    /// its mesh, its material and whether it has a skin, when it is drawn
-    /// as one whole mesh.
+    /// Image maps from shader stages using supported blend modes,
+    /// retaining their blend mode and whether their coordinates come
+    /// from `tcGen environment`.
+    /// Returns the complete, ordered JA shader stages.
+    fn shader_stages(
+        shaders: Option<&BTreeMap<String, fmt_ja::shader::Shader>>,
+        shader_name: Option<&str>,
+    ) -> Vec<(String, Vec<Vec<String>>, Surface, bool)> {
+        let Some(shader) =
+            shader_name.and_then(|name| shaders.and_then(|shaders| shaders.get(name)))
+        else {
+            return Vec::new();
+        };
+
+        shader
+            .stages
+            .iter()
+            .filter_map(|stage| {
+                let texture = stage.iter().find_map(|directive| {
+                    if matches!(directive.first()?.as_str(), "map" | "clampmap") {
+                        let name = directive.get(1)?;
+                        (!name.starts_with('$')).then(|| name.clone())
+                    } else {
+                        None
+                    }
+                })?;
+
+                let blend = stage
+                    .iter()
+                    .find(|directive| directive.first().is_some_and(|name| name == "blendFunc"));
+
+                let surface = match blend {
+                    None => Surface::Opaque,
+                    Some(d) => match d.get(1..).unwrap_or_default() {
+                        [a, b] if a == "GL_ONE" && b == "GL_ONE" => Surface::AddOne,
+                        [a, b] if a == "GL_SRC_ALPHA" && b == "GL_ONE" => Surface::Additive,
+                        [a, b] if a == "GL_SRC_ALPHA" && b == "GL_ONE_MINUS_SRC_ALPHA" => {
+                            Surface::Blend
+                        }
+                        [a, b] if a == "GL_DST_COLOR" && b == "GL_ZERO" => Surface::Filter,
+                        [a, b] if a == "GL_DST_COLOR" && b == "GL_SRC_COLOR" => Surface::Modulate,
+                        [name] if name == "add" => Surface::AddOne,
+                        [name] if name == "filter" => Surface::Filter,
+                        [name] if name == "blend" => Surface::Blend,
+                        _ => return None,
+                    },
+                };
+
+                let environment = stage.iter().any(|directive| {
+                    directive.first().is_some_and(|name| name == "tcGen")
+                        && directive.get(1).is_some_and(|value| value == "environment")
+                });
+
+                Some((texture, stage.clone(), surface, environment))
+            })
+            .collect()
+    }
+
+    /// One mesh of a model, hung from its node.
     fn mesh(
         &mut self,
         commands: &mut Commands,
         stores: &mut Stores,
-        (placed, part, is_room): (&Placed, &asset_odyssey::model::MeshIr, bool),
+        (placed, part, is_room, mesh_index): (&Placed, &asset_odyssey::model::MeshIr, bool, usize),
         nodes: &[Entity],
     ) -> Option<(Entity, AssetId<Mesh>, Handle<OdysseyMaterial>, bool)> {
         let tally = &mut self.tally;
@@ -1315,7 +1415,8 @@ impl<'t> Spawner<'t> {
         // mesh; a decal's are drawn (a textured window or grate seen from
         // both sides, a JA shader's `cull none`), and a mesh whose textures
         // say nothing is drawn from both sides.
-        let culled = !facts.iter().all(|facts| facts.decal || facts.two_sided);
+        //let culled = !facts.iter().all(|facts| facts.decal || facts.two_sided);
+        let culled = false; // DEBUG: disable backface culling to test winding
         let lighting = Lighting {
             self_illum: part.self_illum,
             ambient: part.ambient,
@@ -1325,6 +1426,15 @@ impl<'t> Spawner<'t> {
             is_room,
             fogged: placed.ir.affected_by_fog,
         };
+
+        // Shader-stage overlays are currently limited to ordinary BSP meshes.
+        let shader_stages = if placed.bsp.is_some() && part.skin.is_none() && part.dangly.is_none()
+        {
+            Self::shader_stages(self.ja_shaders, part.texture.as_deref())
+        } else {
+            Vec::new()
+        };
+
         // The env map named by any of the mesh's textures (xoreos takes
         // the last one that names one): a cube map, else a flat texture
         // sphere-mapped (`sphere_envmap`).
@@ -1386,6 +1496,7 @@ impl<'t> Spawner<'t> {
                 stores.materials.add(material)
             })
             .clone();
+
         if let Some((handles, fps)) = texture.and_then(|name| self.frames.get(name))
             && !self
                 .flipbooks
@@ -1480,6 +1591,11 @@ impl<'t> Spawner<'t> {
             commands.entity(child).insert(owner_tag(owner));
         } else if self.unowned {
             commands.entity(child).insert(crate::light_probes::Unowned);
+        }
+        if let Some(bsp) = placed.bsp.as_ref()
+            && let Some(&surface) = bsp.mesh_surface.get(mesh_index)
+        {
+            commands.entity(child).insert(BspMesh { surface });
         }
         if let Some(dangly) = &part.dangly {
             commands
@@ -1753,6 +1869,8 @@ pub(crate) fn spawn_scene(
     mut facts: ResMut<DumpFacts>,
 ) {
     let Some(scene) = scene else { return };
+    let bsp_vis = scene.0.models.iter().find_map(|p| p.bsp.clone());
+    commands.insert_resource(BspCulling { vis: bsp_vis });
     let started = std::time::Instant::now();
     for entity in &old {
         commands.entity(entity).despawn();
@@ -1770,7 +1888,12 @@ pub(crate) fn spawn_scene(
         shown: Vec::new(),
     };
     let (images, mut stores) = assets.split();
-    let mut spawner = Spawner::new(&loaded.textures, loaded.area_light(), images);
+    let mut spawner = Spawner::with_ja_shaders(
+        &loaded.textures,
+        &loaded.ja_shaders,
+        loaded.area_light(),
+        images,
+    );
     // Lights in Bevy world space: model offset and bearing, then the
     // light node's rest-pose position.
     let mut lights = Vec::new();
@@ -1937,6 +2060,13 @@ pub(crate) fn spawn_scene(
         .iter()
         .filter_map(|room| room.floor_error.as_deref())
         .collect();
+    println!();
+    println!("BSP RUNTIME DIAGNOSTICS:");
+    println!("  Scene: {}", loaded.name);
+    println!("  Meshes drawn: {}", tally.drawn);
+    println!("  Meshes with lightmaps: {}", tally.lightmapped);
+    println!("  Hidden meshes: {}", tally.hidden);
+    println!("  Textures loaded: {}", loaded.textures.len());
     facts.0.insert(
         "scene".into(),
         serde_json::json!({
@@ -2224,6 +2354,32 @@ fn cull_rooms(
         "culling".into(),
         serde_json::json!({ "room": name, "visible": visible, "rooms": all.len() }),
     );
+}
+
+/// Hides BSP meshes whose original surface is not visible from the
+/// camera's cluster (Jedi Academy PVS). Meshes without a `BspMesh` (any
+/// non-BSP mesh) are left alone.
+fn cull_bsp(
+    vis: Res<BspCulling>,
+    cameras: Query<&Transform, With<FlyCamera>>,
+    mut meshes: Query<(&BspMesh, &mut Visibility)>,
+) {
+    let Some(bsp) = &vis.vis else { return };
+    let Ok(camera) = cameras.single() else { return };
+    // Camera in game space, metres; the PVS expects the original Q3 units.
+    let eye_m = game_to_bevy().inverse() * camera.translation;
+    let eye_q3 = (eye_m / asset_ja::UNIT).to_array();
+    let Some(cluster) = bsp.visibility.cluster_for_point(eye_q3) else {
+        return;
+    };
+    for (mesh, mut visibility) in &mut meshes {
+        let visible = bsp.visibility.is_surface_visible(cluster, mesh.surface);
+        visibility.set_if_neq(if visible {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        });
+    }
 }
 
 /// The lights that come and go beside the scene's own, as `pick_lights`

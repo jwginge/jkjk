@@ -24,12 +24,14 @@ use fmt_ja::ghoul2::{Gla, Glm, SURFACE_BOLT, SURFACE_OFF};
 
 pub mod angles;
 mod bolt;
+pub mod bsp;
 pub mod events;
 pub mod fx;
 pub mod g2;
 mod playback;
 pub mod rig;
 mod rules;
+pub mod vis;
 
 pub use bolt::{Bolt, blade_tags, bolt};
 pub use playback::{chain, playback};

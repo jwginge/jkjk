@@ -34,6 +34,7 @@ pub struct Files<'a> {
     /// Where large archive entries are kept unpacked, when it opens.
     store: Option<Store>,
     shaders: OnceLock<BTreeMap<String, ShaderLook>>,
+    definitions: OnceLock<BTreeMap<String, fmt_ja::shader::Shader>>,
 }
 
 /// What a model surface's shader gives its look: the texture of its first
@@ -91,6 +92,7 @@ impl<'a> Files<'a> {
             all,
             store: Store::open(),
             shaders: OnceLock::new(),
+            definitions: OnceLock::new(),
         }
     }
 
@@ -200,7 +202,10 @@ fn shader_textures<'f>(files: &'f Files) -> &'f BTreeMap<String, ShaderLook> {
             .all
             .keys()
             .copied()
-            .filter(|name| name.starts_with("shaders/") && name.ends_with(".shader"))
+            .filter(|name| {
+                (name.starts_with("shaders/") || name.starts_with("scripts/"))
+                    && name.ends_with(".shader")
+            })
             .collect();
         let Some(store) = &files.store else {
             return read_shader_textures(files, &names);
@@ -339,6 +344,40 @@ fn read_shader_textures(files: &Files, names: &[&str]) -> BTreeMap<String, Shade
     out
 }
 
+/// Complete parsed shader definitions, retaining every ordered stage.
+/// Kept separately from ShaderLook so existing texture resolution remains
+/// unchanged.
+fn shader_definitions<'f>(files: &'f Files) -> &'f BTreeMap<String, fmt_ja::shader::Shader> {
+    files.definitions.get_or_init(|| {
+        let names: Vec<&str> = files
+            .all
+            .keys()
+            .copied()
+            .filter(|name| {
+                (name.starts_with("shaders/") || name.starts_with("scripts/"))
+                    && name.ends_with(".shader")
+            })
+            .collect();
+
+        let mut out = BTreeMap::new();
+
+        for name in names {
+            let Some(bytes) = files.read(name) else {
+                continue;
+            };
+            let Ok(parsed) = fmt_ja::shader::parse(&bytes) else {
+                continue;
+            };
+
+            for shader in parsed.shaders {
+                out.entry(shader.name.clone()).or_insert(shader);
+            }
+        }
+
+        out
+    })
+}
+
 /// The `blendFunc` of the first stage that has one, for each named shader
 /// (lower-case), as its two factors (lower-case); `add` and `blend` spelt
 /// out as the factors they stand for.
@@ -348,7 +387,10 @@ pub(crate) fn blend_funcs(files: &Files, names: &[String]) -> BTreeMap<String, (
         .all
         .keys()
         .copied()
-        .filter(|name| name.starts_with("shaders/") && name.ends_with(".shader"))
+        .filter(|name| {
+            (name.starts_with("shaders/") || name.starts_with("scripts/"))
+                && name.ends_with(".shader")
+        })
         .collect();
     for file in shader_files {
         let Some(bytes) = files.read(file) else {
@@ -635,12 +677,292 @@ pub(crate) fn skin_beside(files: &Files, model: &str) -> BTreeMap<String, String
         .unwrap_or_else(BTreeMap::new)
 }
 
+fn bsp_player_entry(entities: &[fmt_ja::bsp::BspEntity]) -> Option<([f32; 3], [f32; 2])> {
+    const SPAWN_CLASSES: &[&str] = &[
+        "info_player_deathmatch",
+        "info_player_start",
+        "info_player_coop",
+        "info_player_intermission",
+        "info_player_duel",
+        "info_player_spectator",
+        "team_CTF_redplayer",
+        "team_CTF_blueplayer",
+        "team_redplayer",
+        "team_blueplayer",
+    ];
+
+    let entity = SPAWN_CLASSES.iter().find_map(|class| {
+        entities
+            .iter()
+            .find(|entity| entity.get("classname") == Some(class))
+    })?;
+
+    let origin: [f32; 3] = entity
+        .get("origin")?
+        .split_whitespace()
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .try_into()
+        .ok()?;
+
+    let angle = entity
+        .get("angle")
+        .and_then(|value| value.parse::<f32>().ok())
+        .unwrap_or(0.0)
+        .to_radians();
+
+    Some((
+        origin.map(|value| value * asset_ja::UNIT),
+        [angle.cos(), angle.sin()],
+    ))
+}
+
+/// Load a Jedi Academy BSP map as a static scene.
+fn load_bsp(files: &Files<'_>, path: &str) -> Result<LoadedScene, String> {
+    let path = fmt_ja::game_path(path);
+    let bytes = files
+        .read(&path)
+        .ok_or_else(|| format!("{path}: not found"))?;
+
+    let (ir, bsp) =
+        asset_ja::bsp::model_full(&bytes, &path).map_err(|error| format!("{path}: {error:?}"))?;
+
+    let parsed_bsp = fmt_ja::bsp::parse(&bytes).map_err(|error| format!("{path}: {error:?}"))?;
+
+    let entities = fmt_ja::bsp::parse_entities(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+
+    let entry = bsp_player_entry(&entities);
+
+    let mut entity_classes = std::collections::BTreeMap::<String, usize>::new();
+
+    for entity in &entities {
+        let class = entity.get("classname").unwrap_or("<no classname>");
+        *entity_classes.entry(class.to_string()).or_default() += 1;
+    }
+
+    eprintln!("BSP ENTITY CLASSES:");
+    for (class, count) in &entity_classes {
+        eprintln!("  {class}: {count}");
+    }
+
+    eprintln!("BSP ENTITY MODEL REFERENCES:");
+
+    for class in [
+        "misc_model_static",
+        "func_static",
+        "func_door",
+        "func_breakable",
+    ] {
+        let mut shown = 0;
+
+        for entity in &entities {
+            if entity.get("classname") != Some(class) {
+                continue;
+            }
+
+            eprintln!("  {class}: {:?}", entity.properties);
+            shown += 1;
+
+            if shown >= 3 {
+                break;
+            }
+        }
+    }
+
+    let inline_models: Vec<usize> = entities
+        .iter()
+        .filter_map(|entity| entity.get("model"))
+        .filter_map(|model| model.strip_prefix('*'))
+        .filter_map(|index| index.parse().ok())
+        .collect();
+
+    eprintln!(
+        "BSP INLINE MODEL REFERENCES: {} entities, highest index {:?}",
+        inline_models.len(),
+        inline_models.iter().max()
+    );
+
+    eprintln!("BSP player entry: {entry:?}");
+
+    let parsed_bsp = fmt_ja::bsp::parse(&bytes).map_err(|error| format!("{path}: {error:?}"))?;
+
+    let bsp_models = fmt_ja::bsp::parse_models(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+
+    for (index, model) in bsp_models.iter().enumerate().skip(1) {
+        if model.num_surfaces > 0 {
+            eprintln!(
+                "BSP INLINE {index}: mins={:?}, maxs={:?}, surfaces={}..{}",
+                model.mins,
+                model.maxs,
+                model.first_surface,
+                model.first_surface + model.num_surfaces,
+            );
+        }
+    }
+
+    let entities = fmt_ja::bsp::parse_entities(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+    eprintln!("BSP INLINE ENTITY TRANSFORMS:");
+
+    for entity in &entities {
+        let Some(model_ref) = entity.get("model") else {
+            continue;
+        };
+
+        let Some(index) = model_ref
+            .strip_prefix('*')
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            continue;
+        };
+
+        let Some(model) = bsp_models.get(index) else {
+            continue;
+        };
+
+        if model.num_surfaces == 0 {
+            continue;
+        }
+
+        eprintln!(
+            "  model={index} class={:?} origin={:?} angle={:?} angles={:?}",
+            entity.get("classname"),
+            entity.get("origin"),
+            entity.get("angle"),
+            entity.get("angles"),
+        );
+    }
+
+    for entity in &entities {
+        let classname = entity.get("classname").unwrap_or("");
+
+        if classname.starts_with("info_player_") {
+            eprintln!(
+                "BSP spawn: class={classname}, origin={:?}, angle={:?}, angles={:?}",
+                entity.get("origin"),
+                entity.get("angle"),
+                entity.get("angles"),
+            );
+        }
+    }
+
+    let texture_names: Vec<String> = ir
+        .meshes
+        .iter()
+        .filter_map(|mesh| mesh.texture.clone())
+        .collect();
+    let distinct: std::collections::BTreeSet<&String> = texture_names.iter().collect();
+
+    eprintln!(
+        "BSP: {} meshes, {} with textures, {} distinct shader names",
+        ir.meshes.len(),
+        texture_names.len(),
+        distinct.len()
+    );
+
+    let models = vec![Placed {
+        ir,
+        offset: [0.0; 3],
+        facing: 0.0,
+        is_static: true,
+        attach: None,
+        hook: None,
+        hook_local: None,
+        clip: None,
+        envmap: None,
+        bsp: Some(Arc::new(bsp.clone())),
+    }];
+
+    let mut names = scene_textures(&models, &[]);
+
+    let definitions = shader_definitions(files);
+    let ja_shaders: BTreeMap<String, fmt_ja::shader::Shader> = names
+        .iter()
+        .filter_map(|name| {
+            definitions
+                .get(name)
+                .map(|shader| (name.clone(), shader.clone()))
+        })
+        .collect();
+
+    // Load ordinary image maps referenced by every shader stage.
+    for shader in ja_shaders.values() {
+        for stage in &shader.stages {
+            for directive in stage {
+                if directive.first().is_some_and(|word| {
+                    word.eq_ignore_ascii_case("map") || word.eq_ignore_ascii_case("clampmap")
+                }) {
+                    if let Some(name) = directive.get(1)
+                        && !name.starts_with('$')
+                        && !names.contains(name)
+                    {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let (mut textures, missing) = textures(files, &names);
+
+    eprintln!(
+        "BSP: resolved {} textures, {} missing",
+        textures.len(),
+        missing.len()
+    );
+
+    if !missing.is_empty() {
+        eprintln!(
+            "BSP missing (first {}): {:#?}",
+            missing.len().min(10),
+            &missing[..missing.len().min(10)]
+        );
+    }
+
+    for (name, shader) in &ja_shaders {
+        if ["spot", "light", "lamp", "glow"]
+            .iter()
+            .any(|word| name.contains(word))
+        {
+            eprintln!("JA BSP SHADER: {name}\n{shader:#?}");
+        }
+    }
+
+    // BSP lightmaps are embedded in BspVis and already decoded.
+    textures.extend(bsp.lightmaps.clone());
+
+    Ok(LoadedScene {
+        name: path,
+        models,
+        textures,
+        missing,
+        ja_shaders,
+        ambient: [1.0; 3],
+        lit: true,
+        entry,
+        ..LoadedScene::default()
+    })
+}
+
 pub fn load(
     discovery: &Discovery,
     path: &str,
     sequence: Option<&str>,
     saber: Option<&str>,
 ) -> Result<LoadedScene, String> {
+    if path.to_ascii_lowercase().ends_with(".bsp") {
+        if sequence.is_some() || saber.is_some() {
+            return Err("BSP maps do not support model animations or sabers".to_string());
+        }
+
+        let stack = stack(discovery)?;
+        let files = Files::new(&stack);
+        return load_bsp(&files, path);
+    }
+
     let stack = stack(discovery)?;
     let files = Files::new(&stack);
     let (glm, gla, gla_path) = glm_and_gla(&files, path)?;
@@ -654,12 +976,12 @@ pub fn load(
         ir.animations.push((**clip).clone());
     }
 
-    // An animated model stands on the floor above its origin.
     let floor = if clip.is_some() {
         asset_ja::ORIGIN_HEIGHT
     } else {
         0.0
     };
+
     let mut models = vec![Placed {
         ir,
         offset: [0.0, 0.0, floor],
@@ -670,16 +992,21 @@ pub fn load(
         hook_local: None,
         clip,
         envmap: None,
+        bsp: None,
     }];
+
     let mut blades = Vec::new();
     let mut notes = Vec::new();
+
     if let Some(name) = saber {
         let (hilt, hilt_blades, note) = hilt(&files, name)?;
         let hand = asset_ja::bolt(&glm, "*r_hand").ok_or("*r_hand: no such tag")?;
+
         notes.push(format!(
             "{note}; *r_hand on bone {} (rigid {})",
             hand.bone, hand.rigid
         ));
+
         models.push(Placed {
             ir: hilt,
             offset: [0.0; 3],
@@ -690,13 +1017,17 @@ pub fn load(
             hook_local: Some(hand.matrix),
             clip: None,
             envmap: None,
+            bsp: None,
         });
+
         let model = models.len() - 1;
         blades.extend(hilt_blades.into_iter().map(|b| BladeSpec { model, ..b }));
     }
+
     let (textures, missing) = textures(&files, &scene_textures(&models, &blades));
+
     Ok(LoadedScene {
-        name: path.clone(),
+        name: path,
         models,
         textures,
         missing,

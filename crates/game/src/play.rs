@@ -423,6 +423,7 @@ pub fn compose(
         textures,
         missing: body.missing.clone(),
         missing_body_textures: Vec::new(),
+        ja_shaders: std::collections::BTreeMap::new(),
         default_envmap: None,
         probes,
         entry: None,
