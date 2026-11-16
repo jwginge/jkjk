@@ -50,6 +50,7 @@ use fmt_odyssey::twoda::TwoDa;
 pub mod edges;
 pub mod footprints;
 pub mod ground;
+pub mod ja;
 mod modules;
 pub mod overrides;
 #[cfg(feature = "probes")]

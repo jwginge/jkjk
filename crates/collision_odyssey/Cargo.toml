@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 collision.workspace = true
 fmt_odyssey.workspace = true
+fmt_ja.workspace = true
 asset_odyssey.workspace = true
 
 [features]

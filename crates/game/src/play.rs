@@ -418,12 +418,17 @@ pub fn compose(
         });
     }
     let scene = LoadedScene {
+        collision: None,
+        is_ja: false,
         name,
         models,
         textures,
         missing: body.missing.clone(),
         missing_body_textures: Vec::new(),
         ja_shaders: std::collections::BTreeMap::new(),
+        ja_shader_ir: std::collections::BTreeMap::new(),
+        skybox: None,
+        ja_fogs: Vec::new(),
         default_envmap: None,
         probes,
         entry: None,

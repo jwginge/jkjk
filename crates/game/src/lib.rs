@@ -78,6 +78,8 @@ mod hud;
 pub mod import_verbs;
 pub mod installs;
 mod ja_footsteps;
+mod ja_material;
+mod ja_shader;
 mod landing_fx;
 pub mod launch_times;
 mod leader_view;

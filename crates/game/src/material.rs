@@ -62,7 +62,7 @@ pub(crate) const PARTICLES_SHADER: Handle<Shader> =
     uuid_handle!("a4d81f37-6c2e-4b95-8f03-1e7b9c5d2a68");
 /// `kjk::lighting`, the flash and the fog this material and the grass share.
 const LIGHTING: Handle<Shader> = uuid_handle!("c3a7e215-8d4b-4f6e-b0d2-5e91f7a4c836");
-const TCGEN_ENVIRONMENT: u32 = 32768;
+const TCGEN_ENVIRONMENT: u32 = 524288;
 /// The area's lights, which every material reads unless given others.
 pub const AREA_LIGHTS: Handle<ShaderBuffer> = uuid_handle!("b6e2a9d4-71c3-4f08-8e5a-3d9c0f6b2a17");
 
@@ -107,6 +107,7 @@ const UNLIT: u32 = 32;
 const VERTEX_ALPHA: u32 = 64;
 const FOG: u32 = 128;
 const OPAQUE_TEXTURE: u32 = 256;
+const JA_VERTEX_COLOUR: u32 = 262144u32;
 /// An added surface whose tint's alpha scales what it adds (a clip fades
 /// it: `faded_additive`).
 const ADD_FADE: u32 = 512;
@@ -127,6 +128,9 @@ const EVEN_LIGHT: u32 = 16384;
 /// where it stands (`light_probes`) instead of the area's flat ambient.
 /// Screens that draw a model in their own light do not set it.
 const PROBED: u32 = 32768;
+/// A JA shader stage that samples the BSP lightmap directly using UV1.
+const LIGHTMAP_STAGE: u32 = 65536;
+const IGNORE_VERTEX_COLOR: u32 = 131072;
 
 /// Most lights a surface is lit by at once: the nearest to the camera win.
 /// Our chosen cap (the shader's light list is this long).
@@ -577,6 +581,8 @@ pub enum Surface {
     /// for a punch-through texture, so its texels are either solid or gone.
     Cutout,
     /// Transparent pass, alpha-blended, no depth writes.
+    /// JA BSP base surfaces use this pass with alpha 1 (no visible blend),
+    /// sorting far to near in surface-lump order without writing depth.
     Blend,
     /// Transparent pass, `src × src alpha + dst` (the executable's blend
     /// table for a TXI `blending additive`: `GL_SRC_ALPHA, GL_ONE`), no
@@ -782,6 +788,8 @@ pub struct OdysseyParams {
     pub fog_range: Vec4,
     /// Added to the diffuse UVs (`animateuv`).
     pub uv_offset: Vec2,
+    /// Multiplies diffuse UVs before offsets and animation.
+    pub uv_scale: Vec2,
     pub flags: u32,
     /// Its slot of `ANIMATED` (`Animated`); 0 for none.
     pub slot: u32,
@@ -829,6 +837,8 @@ pub struct OdysseyMaterial {
     /// (`light_probes::AREA_PROBES`). Only `odyssey.wgsl` reads it.
     pub probes: Handle<ShaderBuffer>,
     pub surface: Surface,
+    pub depth_write: Option<bool>,
+    pub ja_reverse_z: bool,
     /// Its back faces are not drawn (reone and xoreos cull a KOTOR mesh's
     /// back faces, a decal texture's excepted): a camera behind a wall or
     /// under a floor sees through it, or inside a character's head through
@@ -844,6 +854,8 @@ pub struct OdysseyMaterial {
     /// How the mesh is drawn while its alpha is below 1 and while it is 1,
     /// for a mesh whose alpha a clip keys (`Looks`). `None` for the rest.
     pub looks: Option<Looks>,
+    /// Jedi Academy shader-stage order for transparent fallback materials.
+    pub ja_stage_order: Option<u32>,
 }
 
 /// What a surface changes in a material: the surface, the shader flags and
@@ -1047,6 +1059,21 @@ impl OdysseyMaterial {
     /// flares). reone adds such a texture's colour, its alpha taken from
     /// its brightness, which comes to the same; the texture's own alpha is
     /// not coverage here.
+    pub fn ignore_vertex_color(mut self) -> OdysseyMaterial {
+        self.params.flags |= IGNORE_VERTEX_COLOR;
+        self
+    }
+    pub fn ignore_vertex_color_if(self, condition: bool) -> OdysseyMaterial {
+        if condition {
+            self.ignore_vertex_color()
+        } else {
+            self
+        }
+    }
+    pub fn ja_reverse_z(mut self) -> Self {
+        self.ja_reverse_z = true;
+        self
+    }
     pub fn faded_additive(mut self) -> OdysseyMaterial {
         self.surface = Surface::AddOne;
         self.params.flags &= !(DISCARD_ZERO_ALPHA | OPAQUE_ALPHA | VERTEX_ALPHA);
@@ -1082,6 +1109,12 @@ impl OdysseyMaterial {
         self
     }
 
+    /// Draw the BSP lightmap itself as a shader stage, using the second UV set.
+    pub fn lightmap_stage(mut self) -> OdysseyMaterial {
+        self.params.flags |= LIGHTMAP_STAGE;
+        self
+    }
+
     /// The diffuse texture has no alpha (a DXT1, an RGB image): it is taken
     /// as 1, so a DXT1 kept in blocks samples its transparent texel as the
     /// games drew it, opaque black.
@@ -1091,7 +1124,28 @@ impl OdysseyMaterial {
         }
         self
     }
-
+    pub fn unlit(mut self) -> OdysseyMaterial {
+        self.params.flags |= UNLIT;
+        self
+    }
+    pub fn unlit_if(mut self, condition: bool) -> OdysseyMaterial {
+        if condition {
+            self.params.flags |= UNLIT;
+        }
+        self
+    }
+    /// Multiplies the diffuse by the mesh's per-vertex colour (`in.color`
+    /// in the shader). Set for a JA shader stage with `rgbGen exactVertex`
+    /// or `rgbGen vertex`: Hoth's `_vertex` textures are authored to be
+    /// tinted this way, and without it they render at the raw texture's
+    /// brightness, which is far brighter than the baked `[40, 40, 40]`
+    /// (or darker, or brighter — whatever the artist baked per vertex)
+    /// that JA multiplies in. Leaves `Surface::Opaque*` as `Opaque*` and
+    /// does not touch `VERTEX_ALPHA`.
+    pub fn ja_vertex_colour(mut self) -> OdysseyMaterial {
+        self.params.flags |= JA_VERTEX_COLOUR;
+        self
+    }
     pub fn new(
         tint: Vec4,
         base: Option<Handle<Image>>,
@@ -1162,6 +1216,7 @@ impl OdysseyMaterial {
                 fog_color: fog.map_or(Vec4::ZERO, |fog| colour(fog.color)),
                 fog_range: fog.map_or(Vec4::ZERO, |fog| Vec4::new(fog.near, fog.far, 0.0, 0.0)),
                 uv_offset: Vec2::ZERO,
+                uv_scale: Vec2::ONE,
                 flags,
                 slot: 0,
                 glow: Vec4::ONE,
@@ -1178,10 +1233,13 @@ impl OdysseyMaterial {
             shadow_tiles: Some(crate::shadow_tiles::ATLAS),
             probes: crate::light_probes::AREA_PROBES,
             surface,
+            depth_write: None,
+            ja_reverse_z: false,
             culled: false,
             emitted: None,
             motion_only: false,
             looks: None,
+            ja_stage_order: None,
         }
     }
 
@@ -1257,10 +1315,17 @@ impl OdysseyMaterial {
     /// The same light on no surface of its own: opaque, untextured, without
     /// its glow, and in its vertices' colours (a wound's cap, lit as the body
     /// it is cut from).
+    /// Applies a static texture-coordinate scale to this material.
+    pub fn ja_uv_scale(mut self, scale: Vec2) -> OdysseyMaterial {
+        self.params.uv_scale = scale;
+        self
+    }
+
     pub fn bare(mut self) -> OdysseyMaterial {
         self.params.tint = Vec4::ONE;
         self.params.self_illum = Vec4::new(0.0, 0.0, 0.0, 1.0);
         self.params.uv_offset = Vec2::ZERO;
+        self.params.uv_scale = Vec2::ONE;
         self.params.slot = 0;
         self.params.flags &= STATIC | UNLIT | FOG | SHADOWED | PROBED;
         self.base = None;
@@ -1366,10 +1431,41 @@ impl OdysseyMaterial {
         self
     }
 
+    /// This material with a different `Surface`. Overlays sit at the base
+    /// mesh's exact position; an `Opaque` overlay (a stage without a
+    /// `blendFunc` parses as one) would z-fight the base and win per-pixel
+    /// by LSB luck — black triangles. The caller swaps it for `Filter`
+    /// (multiply blend, no depth write) before spawning it as a sibling.
+    pub fn with_surface(mut self, surface: Surface) -> OdysseyMaterial {
+        self.surface = surface;
+        self
+    }
+    pub fn with_depth_write(mut self, depth_write: bool) -> OdysseyMaterial {
+        self.depth_write = Some(depth_write);
+        self
+    }
+
     /// An emitter's particles', `rank`th among their model's emitters
     /// (`emitted`).
     pub fn emitted(mut self, rank: u32) -> OdysseyMaterial {
         self.emitted = Some(rank);
+        self
+    }
+
+    /// Orders a transparent fallback alongside the other stages of a JA shader.
+    pub fn ja_stage_order(mut self, order: u32) -> OdysseyMaterial {
+        self.ja_stage_order = Some(order);
+        self
+    }
+
+    /// Applies Jedi Academy stage fog independently of ordinary
+    /// Odyssey opaque-surface fog rules.
+    pub fn ja_stage_fog(mut self, fog: Option<Fog>) -> OdysseyMaterial {
+        if let Some(fog) = fog {
+            self.params.flags |= FOG;
+            self.params.fog_color = Vec4::new(fog.color[0], fog.color[1], fog.color[2], 1.0);
+            self.params.fog_range = Vec4::new(fog.near, fog.far, 0.0, 0.0);
+        }
         self
     }
 }
@@ -1424,6 +1520,7 @@ pub struct OdysseyKey {
     /// It discards alpha 0 (`DISCARD_ZERO_ALPHA`): its prepass does too.
     cut: bool,
     motion_only: bool,
+    ja_reverse_z: bool,
 }
 
 impl From<&OdysseyMaterial> for OdysseyKey {
@@ -1431,11 +1528,14 @@ impl From<&OdysseyMaterial> for OdysseyKey {
         let surface = material.surface;
         OdysseyKey {
             blend: blend(surface),
-            depth_write: writes_depth(surface),
+            depth_write: material
+                .depth_write
+                .unwrap_or_else(|| writes_depth(surface)),
             culled: material.culled,
             particles: material.particles.id() != NO_PARTICLES.id(),
             cut: material.params.flags & DISCARD_ZERO_ALPHA != 0,
             motion_only: material.motion_only,
+            ja_reverse_z: material.ja_reverse_z,
         }
     }
 }
@@ -1548,12 +1648,22 @@ impl Material for OdysseyMaterial {
     /// the blended, one nearer than a cell's force field by its middle drew
     /// over the field (TSL's Telos cells: the Exile's bare body, whose texture
     /// has alpha, not Kreia's robe, which has none).
+    ///
+    /// `BlendOpaque` draws the whole BSP world in the transparent phase at
+    /// the far end (JA draws a BSP's world in surface-lump order, without
+    /// depth writes; the transparent phase's far-to-near sort reproduces
+    /// that painter's order, and gives back faces and coplanar overlays
+    /// their correct relative depths).
     fn depth_bias(&self) -> f32 {
         match self.surface {
             Surface::OpaqueAlpha => OPAQUE_FIRST,
-            _ => self
-                .emitted
-                .map_or(0.0, |rank| EMITTERS_LAST + rank as f32 * EMITTER_STEP),
+            _ => self.ja_stage_order.map_or_else(
+                || {
+                    self.emitted
+                        .map_or(0.0, |rank| EMITTERS_LAST + rank as f32 * EMITTER_STEP)
+                },
+                |order| order as f32 * 0.001,
+            ),
         }
     }
 
@@ -1663,29 +1773,18 @@ impl Material for OdysseyMaterial {
         }
         if let Some(depth) = descriptor.depth_stencil.as_mut() {
             depth.depth_write_enabled = Some(key.depth_write);
+            // Overlays sit exactly on the base mesh (same geometry, same
+            // transform). With `Less` the depth test loses the coplanar fight
+            // by a pixel's LSB and the base shows through in triangles. Let
+            // equal depth pass, so the overlay's blend sees the base's colour.
+            if !key.depth_write {
+                depth.depth_compare = Some(if key.ja_reverse_z {
+                    bevy::render::render_resource::CompareFunction::GreaterEqual
+                } else {
+                    bevy::render::render_resource::CompareFunction::LessEqual
+                });
+            }
         }
-        if key.blend == blend(Surface::AddOne) {
-            let blends: Vec<bool> = descriptor
-                .fragment
-                .as_ref()
-                .map(|fragment| {
-                    fragment
-                        .targets
-                        .iter()
-                        .flatten()
-                        .map(|target| target.blend == key.blend)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            eprintln!(
-                "ADDONE PIPELINE DEBUG: depth_write={} targets={} blend_matches={:?}",
-                key.depth_write,
-                blends.len(),
-                blends
-            );
-        }
-
         Ok(())
     }
 }

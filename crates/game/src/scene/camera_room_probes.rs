@@ -66,7 +66,9 @@ fn rooms() -> (Vec<RoomView>, Culling) {
 fn shown(rooms: &[RoomView], culling: &Culling, eye: Vec3) -> Vec<usize> {
     let here = culling.eye_rooms(rooms, eye);
     (0..rooms.len())
-        .filter(|&room| culling.room_visible(rooms, here.as_deref(), eye, f32::INFINITY, room))
+        .filter(|&room| {
+            culling.room_visible(rooms, here.as_deref(), eye, f32::INFINITY, false, room)
+        })
         .collect()
 }
 

@@ -11,6 +11,7 @@ pub mod camera_room_probes;
 use asset_odyssey::model::Matrix;
 use asset_odyssey::texture::{Encoding, TextureFacts, TextureIr};
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::primitives::Aabb;
 use bevy::camera::{CameraOutputMode, ClearColorConfig, CompositingSpace, RenderTarget};
 use bevy::core_pipeline::tonemapping::{DebandDither, Tonemapping};
 use bevy::image::{
@@ -18,13 +19,14 @@ use bevy::image::{
     ImageSampler, ImageSamplerDescriptor,
 };
 use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::light::Skybox;
 use bevy::light::cluster::{ClusterConfig, GlobalClusterSettings};
 use bevy::mesh::skinning::{SkinnedMesh, SkinnedMeshInverseBindposes};
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    BlendState, Extent3d, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
-    TextureViewDimension,
+    BlendComponent, BlendFactor, BlendOperation, BlendState, Extent3d, TextureDimension,
+    TextureFormat, TextureUsages, TextureViewDescriptor, TextureViewDimension,
 };
 use bevy::render::renderer::RenderDevice;
 use bevy::render::storage::ShaderBuffer;
@@ -66,6 +68,12 @@ pub struct FrameSize(pub u32, pub u32);
 #[derive(Resource)]
 pub struct SceneContent(pub Box<LoadedScene>);
 
+/// A marker for the scene's own 3D camera, so `spawn_camera` can tell
+/// whether it already made one this run (`Startup` before the scene; then
+/// once more when `SceneContent` appears, replacing the placeholder).
+#[derive(Component)]
+struct SceneCameraSpawned;
+
 /// The camera's direction in game space, kept so the fly controls and
 /// `camera` commands agree on it.
 #[derive(Component)]
@@ -83,6 +91,8 @@ struct RoomOf(usize);
 #[derive(Component)]
 pub(crate) struct BspMesh {
     pub surface: usize,
+    pub fog: i32,
+    pub is_sky: bool,
 }
 
 /// A placed model's root: its index in `LoadedScene::models` and its node
@@ -164,6 +174,7 @@ impl Culling {
         here: Option<&[usize]>,
         eye: Vec3,
         fog_far: f32,
+        is_ja: bool,
         room: usize,
     ) -> bool {
         let near = || {
@@ -177,9 +188,20 @@ impl Culling {
         };
         match here {
             Some(here) => {
-                here.iter()
-                    .any(|&here| crate::fight_rooms::linked(rooms, here, room))
-                    || (fog_far.is_finite() && near())
+                if is_ja {
+                    here.iter().any(|&source| {
+                        rooms
+                            .get(source)
+                            .zip(rooms.get(room))
+                            .is_some_and(|(from, to)| {
+                                from.visible.iter().any(|name| name == &to.name)
+                            })
+                    }) || (fog_far.is_finite() && near())
+                } else {
+                    here.iter()
+                        .any(|&source| crate::fight_rooms::linked(rooms, source, room))
+                        || (fog_far.is_finite() && near())
+                }
             }
             None => true,
         }
@@ -310,23 +332,23 @@ impl Plugin for ScenePlugin {
         // still hold the world as drawn, and resolving them over the frame
         // undid every pass between whenever it drew anything.
         app.add_plugins(bevy_post_process::msaa_writeback::MsaaWritebackPlugin);
-        app.add_plugins((
-            OdysseyMaterialPlugin,
-            crate::shell::ShellPlugin,
-            crate::scene_fx::EffectsPlugin,
-            crate::heat_haze::HeatHazePlugin,
-            crate::glow_shell::GlowShellPlugin,
-            crate::speed_blur::SpeedBlurPlugin,
-            crate::temporal::TemporalPlugin,
-            crate::rolloff::RollOffPlugin,
-            crate::own_fx::OwnFxPlugin,
-            crate::grass::GrassPlugin,
-            crate::dangly::DanglyPlugin,
-            crate::wind::WindPlugin,
-            crate::weather::WeatherPlugin,
-            crate::shadows::ShadowsPlugin,
-            crate::shadow_tiles::ShadowTilesPlugin,
-        ))
+        app.add_plugins((OdysseyMaterialPlugin, crate::ja_material::JaMaterialPlugin))
+            .add_plugins((
+                crate::shell::ShellPlugin,
+                crate::scene_fx::EffectsPlugin,
+                crate::heat_haze::HeatHazePlugin,
+                crate::glow_shell::GlowShellPlugin,
+                crate::speed_blur::SpeedBlurPlugin,
+                crate::temporal::TemporalPlugin,
+                crate::rolloff::RollOffPlugin,
+                crate::own_fx::OwnFxPlugin,
+                crate::grass::GrassPlugin,
+                crate::dangly::DanglyPlugin,
+                crate::wind::WindPlugin,
+                crate::weather::WeatherPlugin,
+                crate::shadows::ShadowsPlugin,
+                crate::shadow_tiles::ShadowTilesPlugin,
+            ))
         .add_plugins((
             crate::light_probes::LightProbesPlugin,
             crate::ray_structures::RayStructuresPlugin,
@@ -335,6 +357,17 @@ impl Plugin for ScenePlugin {
             crate::linear_frame::LinearFramePlugin,
         ))
         .add_systems(Startup, spawn_camera)
+        // Once the scene exists (which for a `kjk view` run is after
+        // startup, from `runtime`), the placeholder `Camera2d` is
+        // replaced by the scene's `Camera3d`, at `scene.entry`. Without
+        // this, `cull_bsp` ran its PVS queries against whatever the
+        // placeholder's default transform was, at the map's origin,
+        // and hid most of the map. Runs once per `SceneContent`
+        // generation.
+        .add_systems(
+            Update,
+            respawn_camera_on_scene.before(apply_camera_request),
+        )
         .add_systems(
             Update,
             // The warm-up reads the new meshes before their data goes
@@ -371,6 +404,7 @@ impl Plugin for ScenePlugin {
                 find_player,
                 pick_lights.in_set(LightsPicked),
                 scroll_uvs,
+                animate_ja_tc_mods,
                 cycle_flipbooks,
                 animate,
             )
@@ -531,7 +565,68 @@ fn spawn_camera(
         }
         return;
     };
+    let skybox = scene
+        .0
+        .skybox
+        .as_ref()
+        .map(|texture| images.add(image(texture)));
     let mut camera = commands.spawn(scene_camera(&scene.0));
+    if let Some(image) = skybox {
+        camera.insert(Skybox {
+            image: Some(image),
+            brightness: 1000.0,
+            rotation: Quat::IDENTITY,
+        });
+    }
+    camera.insert(SceneCameraSpawned);
+    if let Some(target) = target {
+        camera.insert(target);
+    }
+}
+
+/// Once `SceneContent` first exists (which for `kjk view ja` is after
+/// `Startup`, since the launcher inserts it from `runtime`), the
+/// placeholder `Camera2d` from `spawn_camera` is replaced by the scene's
+/// own `Camera3d`, at `scene.entry`. Without this the PVS ran against the
+/// placeholder's default transform (map origin, Bevy space), and most of
+/// the map was culled as "not visible" from there.
+fn respawn_camera_on_scene(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    scene: Option<Res<SceneContent>>,
+    existing: Query<(Entity, Option<&RenderTarget>), With<SceneCameraSpawned>>,
+    placeholders: Query<
+        (Entity, Option<&RenderTarget>),
+        (With<Camera2d>, Without<SceneCameraSpawned>),
+    >,
+) {
+    let Some(scene) = scene else { return };
+    // Already replaced for this scene; nothing to do.
+    if !existing.is_empty() {
+        return;
+    }
+    // Keep the render target of the placeholder (a headless run sets one).
+    let target = placeholders
+        .iter()
+        .next()
+        .and_then(|(_, target)| target.cloned());
+    for (entity, _) in &placeholders {
+        commands.entity(entity).despawn();
+    }
+    let skybox = scene
+        .0
+        .skybox
+        .as_ref()
+        .map(|texture| images.add(image(texture)));
+    let mut camera = commands.spawn(scene_camera(&scene.0));
+    if let Some(image) = skybox {
+        camera.insert(Skybox {
+            image: Some(image),
+            brightness: 1000.0,
+            rotation: Quat::IDENTITY,
+        });
+    }
+    camera.insert(SceneCameraSpawned);
     if let Some(target) = target {
         camera.insert(target);
     }
@@ -549,7 +644,19 @@ pub(crate) fn replace_camera(world: &mut World, scene: &LoadedScene) {
     for (entity, _) in old {
         world.despawn(entity);
     }
+    let skybox = scene.skybox.as_ref().map(|texture| {
+        let mut images = world.resource_mut::<Assets<Image>>();
+        images.add(image(texture))
+    });
     let mut camera = world.spawn(scene_camera(scene));
+    if let Some(image) = skybox {
+        camera.insert(Skybox {
+            image: Some(image),
+            brightness: 1000.0,
+            rotation: Quat::IDENTITY,
+        });
+    }
+    camera.insert(SceneCameraSpawned);
     if let Some(target) = target {
         camera.insert(target);
     }
@@ -557,7 +664,7 @@ pub(crate) fn replace_camera(world: &mut World, scene: &LoadedScene) {
 
 /// A scene's camera, at its entry (or framing it all).
 fn scene_camera(scene: &LoadedScene) -> impl Bundle {
-    let pose = match None::<([f32; 3], [f32; 2])> {
+    let pose = match scene.entry {
         Some((position, direction)) => CameraPose {
             position: [position[0], position[1], position[2] + EYE_HEIGHT],
             yaw: direction[1].atan2(direction[0]).to_degrees(),
@@ -800,9 +907,13 @@ pub(crate) fn flipbook_images(
 /// shows for `1 / fps` seconds, then the next, back to the first after the
 /// last.
 pub(crate) fn flipbook_frame(count: usize, fps: f32, seconds: f32) -> usize {
+    if count <= 1 || !fps.is_finite() || fps <= 0.0 {
+        return 0;
+    }
+
     let frames = count as f32;
     let at = (seconds * fps).rem_euclid(frames);
-    (at.floor() as usize).min(count.saturating_sub(1))
+    (at.floor() as usize).min(count - 1)
 }
 
 fn upload(texture: &TextureIr) -> Image {
@@ -880,6 +991,8 @@ type MaterialKey<'a> = (
     Option<[u32; 2]>,
     bool,
     Option<Surface>,
+    Option<[u32; 5]>,
+    bool,
 );
 
 /// The scene's materials whose diffuse moves: the scene's own and those of
@@ -890,6 +1003,8 @@ type MaterialKey<'a> = (
 pub(crate) struct AnimatedMaterials {
     /// Diffuse UVs that scroll, with their direction.
     scrolling: Vec<(AssetId<OdysseyMaterial>, Vec2)>,
+    /// Jedi Academy materials with time-dependent tcMod operations.
+    ja_tc_modulated: Vec<AssetId<crate::ja_material::JaMaterial>>,
     /// Flip-books: each frame's image, and frames per second.
     flipbooks: Vec<(AssetId<OdysseyMaterial>, Vec<Handle<Image>>, f32)>,
 }
@@ -900,6 +1015,8 @@ impl AnimatedMaterials {
         let scrolling = spawner.scrolling.drain(..);
         self.scrolling
             .extend(scrolling.map(|(handle, dir)| (handle.id(), dir)));
+        self.ja_tc_modulated
+            .extend(spawner.ja_tc_modulated.drain(..).map(|handle| handle.id()));
         let flipbooks = spawner.flipbooks.drain(..);
         self.flipbooks
             .extend(flipbooks.map(|(handle, frames, fps)| (handle.id(), frames, fps)));
@@ -992,6 +1109,7 @@ const LIGHT_RADIUS_BIAS: f32 = 64.0;
 pub(crate) struct Stores<'a> {
     pub meshes: &'a mut Assets<Mesh>,
     pub materials: &'a mut Assets<OdysseyMaterial>,
+    pub ja_materials: &'a mut Assets<crate::ja_material::JaMaterial>,
     pub bindposes: &'a mut Assets<SkinnedMeshInverseBindposes>,
     /// Emitters' particle lists (`model_fx::Spray`).
     pub buffers: &'a mut Assets<ShaderBuffer>,
@@ -1002,6 +1120,7 @@ pub(crate) struct Stores<'a> {
 pub(crate) struct ModelAssets<'w> {
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<OdysseyMaterial>>,
+    ja_materials: ResMut<'w, Assets<crate::ja_material::JaMaterial>>,
     images: ResMut<'w, Assets<Image>>,
     bindposes: ResMut<'w, Assets<SkinnedMeshInverseBindposes>>,
     buffers: ResMut<'w, Assets<ShaderBuffer>>,
@@ -1016,6 +1135,7 @@ impl ModelAssets<'_> {
             Stores {
                 meshes: &mut self.meshes,
                 materials: &mut self.materials,
+                ja_materials: &mut self.ja_materials,
                 bindposes: &mut self.bindposes,
                 buffers: &mut self.buffers,
             },
@@ -1048,12 +1168,51 @@ pub(crate) struct Spawner<'t> {
     pub textures: BTreeMap<&'t str, Handle<Image>>,
     irs: &'t BTreeMap<String, TextureIr>,
     ja_shaders: Option<&'t BTreeMap<String, fmt_ja::shader::Shader>>,
+    ja_shader_ir: Option<&'t BTreeMap<String, crate::ja_shader::JaShader>>,
+    ja_fogs: &'t [crate::viewer::JaFog],
+    has_skybox: bool,
+    /// A 1Ã—1 white image: a sky with no texture of its own multiplies it
+    /// by the fog's colour (`mesh`).
+    white: Handle<Image>,
     /// One image per frame for each flip-book diffuse, and its rate.
     frames: BTreeMap<&'t str, (Vec<Handle<Image>>, f32)>,
     area: AreaLight,
     cache: BTreeMap<MaterialKey<'t>, Handle<OdysseyMaterial>>,
+    ja_stage_cache: BTreeMap<
+        (
+            String,
+            String,
+            Surface,
+            [u32; 4],
+            [u32; 11],
+            [u32; 5],
+            bool,
+            bool,
+            bool,
+            bool,
+            u32,
+            bool,
+        ),
+        Handle<OdysseyMaterial>,
+    >,
+    ja_material_cache: std::collections::HashMap<
+        (
+            String,
+            crate::ja_material::JaMaterialKey,
+            [u32; 4],
+            bool,
+            Option<String>,
+            u32,
+            [u32; 48],
+            [u32; 8],
+            bool,
+            [u32; 8],
+        ),
+        Handle<crate::ja_material::JaMaterial>,
+    >,
     pub flipbooks: Vec<(Handle<OdysseyMaterial>, Vec<Handle<Image>>, f32)>,
     pub scrolling: Vec<(Handle<OdysseyMaterial>, Vec2)>,
+    pub ja_tc_modulated: Vec<Handle<crate::ja_material::JaMaterial>>,
     pub tally: Tally,
     /// The room whose model is spawned now. Its meshes carry the room as
     /// their `MeshTag` (the room's index plus 1), which tells the shader
@@ -1090,21 +1249,35 @@ impl<'t> Spawner<'t> {
         area: AreaLight,
         images: &mut Assets<Image>,
     ) -> Spawner<'t> {
-        Self::new_inner(textures, None, area, images)
+        Self::new_inner(textures, None, None, &[], false, area, images)
     }
 
     pub fn with_ja_shaders(
         textures: &'t BTreeMap<String, TextureIr>,
         ja_shaders: &'t BTreeMap<String, fmt_ja::shader::Shader>,
+        ja_shader_ir: &'t BTreeMap<String, crate::ja_shader::JaShader>,
+        ja_fogs: &'t [crate::viewer::JaFog],
+        has_skybox: bool,
         area: AreaLight,
         images: &mut Assets<Image>,
     ) -> Spawner<'t> {
-        Self::new_inner(textures, Some(ja_shaders), area, images)
+        Self::new_inner(
+            textures,
+            Some(ja_shaders),
+            Some(ja_shader_ir),
+            ja_fogs,
+            has_skybox,
+            area,
+            images,
+        )
     }
 
     fn new_inner(
         textures: &'t BTreeMap<String, TextureIr>,
         ja_shaders: Option<&'t BTreeMap<String, fmt_ja::shader::Shader>>,
+        ja_shader_ir: Option<&'t BTreeMap<String, crate::ja_shader::JaShader>>,
+        ja_fogs: &'t [crate::viewer::JaFog],
+        has_skybox: bool,
         area: AreaLight,
         images: &mut Assets<Image>,
     ) -> Spawner<'t> {
@@ -1118,15 +1291,34 @@ impl<'t> Spawner<'t> {
             .filter_map(|(name, texture)| Some((name.as_str(), flipbook_images(texture, images)?)))
             .collect();
 
+        let white = images.add(Image::new(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            vec![255, 255, 255, 255],
+            TextureFormat::Rgba8Unorm,
+            RenderAssetUsages::RENDER_WORLD,
+        ));
+
         Spawner {
             textures: handles,
             irs: textures,
             ja_shaders,
+            ja_shader_ir,
+            ja_fogs,
+            has_skybox,
+            white,
             frames,
             area,
             cache: BTreeMap::new(),
+            ja_stage_cache: BTreeMap::new(),
+            ja_material_cache: std::collections::HashMap::new(),
             flipbooks: Vec::new(),
             scrolling: Vec::new(),
+            ja_tc_modulated: Vec::new(),
             tally: Tally::default(),
             room: None,
             walled: false,
@@ -1269,16 +1461,24 @@ impl<'t> Spawner<'t> {
         first
     }
 
-    /// Image maps from shader stages using supported blend modes,
-    /// retaining their blend mode and whether their coordinates come
-    /// from `tcGen environment`.
-    /// Returns the complete, ordered JA shader stages.
-    fn shader_stages(
-        shaders: Option<&BTreeMap<String, fmt_ja::shader::Shader>>,
+    /// The JA shader's stages paired with the raw `fmt_ja` stage text and
+    /// the typed interpretation the caller uses to detect `$lightmap`-ness,
+    /// `uses_vertex_color`, `tcGen environment`. `shader_stages` still
+    /// returns one entry per *rendering* stage (stages with no drawable
+    /// `map`/`clampmap` are dropped); the `&JaStage` is aligned to that
+    /// filtered list so `index == 0` is the first drawable stage.
+    fn shader_stages<'s>(
+        _shaders: Option<&'s BTreeMap<String, fmt_ja::shader::Shader>>,
+        shader_ir: Option<&'s BTreeMap<String, crate::ja_shader::JaShader>>,
         shader_name: Option<&str>,
-    ) -> Vec<(String, Vec<Vec<String>>, Surface, bool)> {
-        let Some(shader) =
-            shader_name.and_then(|name| shaders.and_then(|shaders| shaders.get(name)))
+    ) -> Vec<(
+        Option<&'s crate::ja_shader::JaStage>,
+        String,
+        Vec<Vec<String>>,
+        Surface,
+        bool,
+    )> {
+        let Some(shader) = shader_name.and_then(|name| shader_ir.and_then(|ir| ir.get(name)))
         else {
             return Vec::new();
         };
@@ -1286,47 +1486,684 @@ impl<'t> Spawner<'t> {
         shader
             .stages
             .iter()
-            .filter_map(|stage| {
-                let texture = stage.iter().find_map(|directive| {
-                    if matches!(directive.first()?.as_str(), "map" | "clampmap") {
-                        let name = directive.get(1)?;
-                        (!name.starts_with('$')).then(|| name.clone())
+            .map(|stage| {
+                let texture = stage
+                    .directives
+                    .iter()
+                    .find_map(|directive| {
+                        if let crate::ja_shader::StageDirectiveKind::Map(map) = &directive.kind {
+                            match map {
+                                crate::ja_shader::TextureMap::Map(name)
+                                | crate::ja_shader::TextureMap::ClampMap(name)
+                                | crate::ja_shader::TextureMap::VideoMap(name) => {
+                                    Some(name.clone())
+                                }
+                                crate::ja_shader::TextureMap::AnimMap { frames, .. }
+                                | crate::ja_shader::TextureMap::ClampAnimMap { frames, .. }
+                                | crate::ja_shader::TextureMap::OneShotAnimMap { frames, .. } => {
+                                    frames.first().cloned()
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or_default();
+
+                let blend = stage.directives.iter().find_map(|directive| {
+                    if let crate::ja_shader::StageDirectiveKind::BlendFunc(blend) = &directive.kind
+                    {
+                        Some(blend)
                     } else {
                         None
                     }
-                })?;
-
-                let blend = stage
-                    .iter()
-                    .find(|directive| directive.first().is_some_and(|name| name == "blendFunc"));
+                });
 
                 let surface = match blend {
                     None => Surface::Opaque,
-                    Some(d) => match d.get(1..).unwrap_or_default() {
-                        [a, b] if a == "GL_ONE" && b == "GL_ONE" => Surface::AddOne,
-                        [a, b] if a == "GL_SRC_ALPHA" && b == "GL_ONE" => Surface::Additive,
-                        [a, b] if a == "GL_SRC_ALPHA" && b == "GL_ONE_MINUS_SRC_ALPHA" => {
-                            Surface::Blend
+                    Some(crate::ja_shader::BlendFunction::Add) => Surface::AddOne,
+                    Some(crate::ja_shader::BlendFunction::Filter) => Surface::Filter,
+                    Some(crate::ja_shader::BlendFunction::Blend) => Surface::Blend,
+                    Some(crate::ja_shader::BlendFunction::Explicit {
+                        source,
+                        destination,
+                    }) => {
+                        match (
+                            source.to_ascii_uppercase().as_str(),
+                            destination.to_ascii_uppercase().as_str(),
+                        ) {
+                            ("GL_ONE", "GL_ONE") => Surface::AddOne,
+                            ("GL_SRC_ALPHA", "GL_ONE") => Surface::Additive,
+                            ("GL_SRC_ALPHA", "GL_ONE_MINUS_SRC_ALPHA") => Surface::Blend,
+                            ("GL_DST_COLOR", "GL_ZERO") => Surface::Filter,
+                            ("GL_DST_COLOR", "GL_SRC_COLOR") => Surface::Modulate,
+                            _ => Surface::Opaque,
                         }
-                        [a, b] if a == "GL_DST_COLOR" && b == "GL_ZERO" => Surface::Filter,
-                        [a, b] if a == "GL_DST_COLOR" && b == "GL_SRC_COLOR" => Surface::Modulate,
-                        [name] if name == "add" => Surface::AddOne,
-                        [name] if name == "filter" => Surface::Filter,
-                        [name] if name == "blend" => Surface::Blend,
-                        _ => return None,
-                    },
+                    }
+                    Some(crate::ja_shader::BlendFunction::Invalid(_)) => Surface::Opaque,
                 };
 
-                let environment = stage.iter().any(|directive| {
-                    directive.first().is_some_and(|name| name == "tcGen")
-                        && directive.get(1).is_some_and(|value| value == "environment")
+                let environment = stage.directives.iter().any(|directive| {
+                    matches!(
+                        &directive.kind,
+                        crate::ja_shader::StageDirectiveKind::TcGen(
+                            crate::ja_shader::TextureCoordinateGeneration::Environment
+                        )
+                    )
                 });
 
-                Some((texture, stage.clone(), surface, environment))
+                let raw = stage.raw.clone();
+                (Some(stage), texture, raw, surface, environment)
             })
             .collect()
     }
 
+    fn shader_stage_tint(stage: &[Vec<String>]) -> Vec4 {
+        let Some(directive) = stage.iter().find(|directive| {
+            directive.first().is_some_and(|name| name == "rgbGen")
+                && directive.get(1).is_some_and(|mode| mode == "const")
+        }) else {
+            return Vec4::ONE;
+        };
+
+        let values: Vec<f32> = directive
+            .iter()
+            .skip(2)
+            .filter_map(|token| {
+                token
+                    .trim_matches(|c: char| matches!(c, '(' | ')' | ','))
+                    .parse::<f32>()
+                    .ok()
+            })
+            .collect();
+
+        if values.len() < 3 {
+            return Vec4::ONE;
+        }
+
+        Vec4::new(
+            values[0],
+            values[1],
+            values[2],
+            values.get(3).copied().unwrap_or(1.0),
+        )
+    }
+
+    fn shader_stage_uses_vertex_color(stage: &[Vec<String>]) -> bool {
+        stage
+            .iter()
+            .find(|directive| directive.first().is_some_and(|name| name == "rgbGen"))
+            .and_then(|directive| directive.get(1))
+            .is_some_and(|mode| mode == "vertex" || mode == "exactVertex")
+    }
+
+    fn ja_blend_factor(name: &str) -> Option<BlendFactor> {
+        use BlendFactor::*;
+
+        match name.trim().to_ascii_uppercase().as_str() {
+            "GL_ZERO" => Some(Zero),
+            "GL_ONE" => Some(One),
+            "GL_SRC_COLOR" => Some(Src),
+            "GL_ONE_MINUS_SRC_COLOR" => Some(OneMinusSrc),
+            "GL_DST_COLOR" => Some(Dst),
+            "GL_ONE_MINUS_DST_COLOR" => Some(OneMinusDst),
+            "GL_SRC_ALPHA" => Some(SrcAlpha),
+            "GL_ONE_MINUS_SRC_ALPHA" => Some(OneMinusSrcAlpha),
+            "GL_DST_ALPHA" => Some(DstAlpha),
+            "GL_ONE_MINUS_DST_ALPHA" => Some(OneMinusDstAlpha),
+            "GL_SRC_ALPHA_SATURATE" => Some(SrcAlphaSaturated),
+            _ => None,
+        }
+    }
+
+    fn ja_blend_state(source: &str, destination: &str) -> Option<BlendState> {
+        let src = Self::ja_blend_factor(source)?;
+        let dst = Self::ja_blend_factor(destination)?;
+
+        let component = BlendComponent {
+            src_factor: src,
+            dst_factor: dst,
+            operation: BlendOperation::Add,
+        };
+
+        Some(BlendState {
+            color: component,
+            alpha: component,
+        })
+    }
+
+    /// A stage as a `JaMaterial`, when `ja.wgsl` can draw it.
+    /// Returns `None` for stages using directives it does not yet handle,
+    /// including animated maps, `alphaGen`, and unsupported `tcGen` modes;
+    /// the caller falls through to `OdysseyMaterial`.
+    fn ja_stage_new_material(
+        cache: &mut std::collections::HashMap<
+            (
+                String,
+                crate::ja_material::JaMaterialKey,
+                [u32; 4],
+                bool,
+                Option<String>,
+                u32,
+                [u32; 48],
+                [u32; 8],
+                bool,
+                [u32; 8],
+            ),
+            Handle<crate::ja_material::JaMaterial>,
+        >,
+        ja_materials: &mut Assets<crate::ja_material::JaMaterial>,
+        textures: &BTreeMap<&'t str, Handle<Image>>,
+        irs: &BTreeMap<String, TextureIr>,
+        stage: &crate::ja_shader::JaStage,
+        lightmap: Option<&str>,
+        stage_order: u32,
+        unlit_base: bool,
+        fog: crate::ja_material::JaFogUniform,
+        ja_tc_modulated: &mut Vec<Handle<crate::ja_material::JaMaterial>>,
+    ) -> Option<Handle<crate::ja_material::JaMaterial>> {
+        use crate::ja_material::{
+            JaMaterial, JaMaterialKey, JaRgbWaveUniform, JaTcModOp, JaTcModUniform,
+        };
+        use crate::ja_shader::{
+            AlphaGeneration, BlendFunction, ColourGeneration, StageDirectiveKind,
+            TextureCoordinateGeneration, TextureCoordinateModifier, TextureMap,
+        };
+
+        let parse_values = |args: &[String]| -> Option<Vec<f32>> {
+            args.iter()
+                .map(|arg| arg.parse::<f32>().ok().filter(|value| value.is_finite()))
+                .collect()
+        };
+
+        let wave_code = |name: &str| -> Option<u32> {
+            match name.to_ascii_lowercase().as_str() {
+                "sin" => Some(1),
+                "triangle" => Some(2),
+                "square" => Some(3),
+                "sawtooth" => Some(4),
+                "inversesawtooth" => Some(5),
+                "noise" => Some(6),
+                _ => None,
+            }
+        };
+
+        let mut texture_name: Option<String> = None;
+        let mut uses_lightmap_uv = false;
+        let mut tint = Vec4::ONE;
+        let mut uses_vertex_color = false;
+        let mut blend_func: Option<BlendFunction> = None;
+        let mut tc_mods = JaTcModUniform::default();
+        let mut tc_mod_count = 0usize;
+        let mut rgb_wave = JaRgbWaveUniform::default();
+
+        for d in &stage.directives {
+            match &d.kind {
+                StageDirectiveKind::Map(TextureMap::Map(n) | TextureMap::ClampMap(n)) => {
+                    texture_name = Some(n.clone());
+                }
+                StageDirectiveKind::Map(_) => return None,
+
+                StageDirectiveKind::RgbGen(ColourGeneration::Constant(args)) => {
+                    let values = parse_values(args)?;
+                    if values.len() < 3 {
+                        return None;
+                    }
+                    tint = Vec4::new(
+                        values[0],
+                        values[1],
+                        values[2],
+                        values.get(3).copied().unwrap_or(1.0),
+                    );
+                }
+                StageDirectiveKind::RgbGen(ColourGeneration::Wave(args)) => {
+                    let Some(wave) = args.first().and_then(|v| wave_code(v)) else {
+                        return None;
+                    };
+                    let values = parse_values(&args[1..])?;
+                    if values.len() != 4 {
+                        return None;
+                    }
+                    rgb_wave.meta.x = wave;
+                    rgb_wave.params = Vec4::new(values[0], values[1], values[2], values[3]);
+                }
+
+                StageDirectiveKind::RgbGen(
+                    ColourGeneration::Vertex | ColourGeneration::ExactVertex,
+                ) => uses_vertex_color = true,
+                StageDirectiveKind::RgbGen(
+                    ColourGeneration::Identity | ColourGeneration::IdentityLighting,
+                ) => {}
+                StageDirectiveKind::RgbGen(_) => return None,
+
+                StageDirectiveKind::BlendFunc(b) => blend_func = Some(b.clone()),
+
+                StageDirectiveKind::AlphaGen(AlphaGeneration::Identity | AlphaGeneration::Skip) => {
+                }
+                StageDirectiveKind::AlphaGen(_) => return None,
+
+                StageDirectiveKind::TcGen(TextureCoordinateGeneration::Base) => {}
+                StageDirectiveKind::TcGen(TextureCoordinateGeneration::Lightmap) => {
+                    uses_lightmap_uv = true;
+                }
+                StageDirectiveKind::TcGen(_) => return None,
+
+                StageDirectiveKind::TcMod(modifier) => {
+                    if tc_mod_count >= 4 {
+                        return None;
+                    }
+
+                    let mut op = JaTcModOp::default();
+
+                    match modifier {
+                        TextureCoordinateModifier::Rotate(args) => {
+                            let values = parse_values(args)?;
+                            if values.len() != 1 {
+                                return None;
+                            }
+                            op.meta.x = 1;
+                            op.params.x = values[0];
+                        }
+
+                        TextureCoordinateModifier::Scale(args) => {
+                            let values = parse_values(args)?;
+                            if values.len() != 2 {
+                                return None;
+                            }
+                            op.meta.x = 2;
+                            op.params = Vec4::new(values[0], values[1], 0.0, 0.0);
+                        }
+
+                        TextureCoordinateModifier::Scroll(args) => {
+                            let values = parse_values(args)?;
+                            if values.len() != 2 {
+                                return None;
+                            }
+                            op.meta.x = 3;
+                            op.params = Vec4::new(values[0], values[1], 0.0, 0.0);
+                        }
+
+                        TextureCoordinateModifier::Stretch(args) => {
+                            let Some(wave) = args.first().and_then(|v| wave_code(v)) else {
+                                return None;
+                            };
+                            let values = parse_values(&args[1..])?;
+                            if values.len() != 4 {
+                                return None;
+                            }
+                            op.meta.x = 4;
+                            op.meta.y = wave;
+                            op.params = Vec4::new(values[0], values[1], values[2], values[3]);
+                        }
+
+                        TextureCoordinateModifier::Transform(args) => {
+                            let values = parse_values(args)?;
+                            if values.len() != 6 {
+                                return None;
+                            }
+                            op.meta.x = 5;
+                            op.params = Vec4::new(values[0], values[1], values[2], values[3]);
+                            op.extra.x = values[4];
+                            op.extra.y = values[5];
+                        }
+
+                        TextureCoordinateModifier::Turb(args) => {
+                            let values = parse_values(args)?;
+                            if values.len() != 4 {
+                                return None;
+                            }
+                            op.meta.x = 6;
+                            op.params = Vec4::new(values[0], values[1], values[2], values[3]);
+                        }
+
+                        // This modifier depends on entity-specific state that
+                        // the current material pipeline does not provide.
+                        TextureCoordinateModifier::EntityTranslate
+                        | TextureCoordinateModifier::Other(_) => return None,
+                    }
+
+                    tc_mods.ops[tc_mod_count] = op;
+                    tc_mod_count += 1;
+                }
+
+                StageDirectiveKind::DepthWrite
+                | StageDirectiveKind::Detail
+                | StageDirectiveKind::AlphaFunc(_)
+                | StageDirectiveKind::Other => {}
+            }
+        }
+
+        tc_mods.time_count.y = tc_mod_count as f32;
+
+        let lightmap_handle = if uses_lightmap_uv {
+            lightmap.and_then(|name| textures.get(name).cloned())
+        } else {
+            None
+        };
+        let lightmap_enabled = u32::from(lightmap_handle.is_some());
+
+        let texture_name = texture_name?;
+        let opaque_texture = irs
+            .get(texture_name.as_str())
+            .is_some_and(|texture| !texture.facts.alpha);
+
+        let image = match textures.get(texture_name.as_str()) {
+            Some(image) => image.clone(),
+            None => return None,
+        };
+
+        let (blend_state, alpha_mode, transparent, depth_write) = match blend_func {
+            None => (None, AlphaMode::Opaque, false, true),
+
+            Some(BlendFunction::Add) => (
+                Self::ja_blend_state("GL_ONE", "GL_ONE"),
+                AlphaMode::Add,
+                true,
+                false,
+            ),
+
+            Some(BlendFunction::Filter) if unlit_base => (None, AlphaMode::Opaque, false, true),
+
+            Some(BlendFunction::Filter) => (
+                Self::ja_blend_state("GL_DST_COLOR", "GL_ZERO"),
+                AlphaMode::Multiply,
+                true,
+                false,
+            ),
+
+            Some(BlendFunction::Blend) => (
+                Self::ja_blend_state("GL_SRC_ALPHA", "GL_ONE_MINUS_SRC_ALPHA"),
+                AlphaMode::Blend,
+                true,
+                false,
+            ),
+
+            Some(BlendFunction::Explicit {
+                source,
+                destination,
+            }) => match Self::ja_blend_state(&source, &destination) {
+                Some(state) => (Some(state), AlphaMode::Blend, true, false),
+                None => return None,
+            },
+
+            Some(BlendFunction::Invalid(_)) => return None,
+        };
+
+        let params = Vec4::new(
+            if uses_lightmap_uv { 1.0 } else { 0.0 },
+            if uses_vertex_color { 1.0 } else { 0.0 },
+            if opaque_texture { 1.0 } else { 0.0 },
+            0.0,
+        );
+
+        let mut tc_mod_key = [0u32; 48];
+        for (index, op) in tc_mods.ops.iter().enumerate() {
+            let offset = index * 12;
+            tc_mod_key[offset..offset + 4].copy_from_slice(&op.meta.to_array());
+            tc_mod_key[offset + 4..offset + 8]
+                .copy_from_slice(&op.params.to_array().map(f32::to_bits));
+            tc_mod_key[offset + 8..offset + 12]
+                .copy_from_slice(&op.extra.to_array().map(f32::to_bits));
+        }
+
+        let rgb_wave_key = [
+            rgb_wave.meta.x,
+            rgb_wave.meta.y,
+            rgb_wave.meta.z,
+            rgb_wave.meta.w,
+            rgb_wave.params.x.to_bits(),
+            rgb_wave.params.y.to_bits(),
+            rgb_wave.params.z.to_bits(),
+            rgb_wave.params.w.to_bits(),
+        ];
+
+        let key = (
+            texture_name,
+            JaMaterialKey {
+                blend: blend_state,
+                depth_write,
+                cull: true,
+            },
+            tint.to_array().map(f32::to_bits),
+            uses_vertex_color,
+            lightmap.map(str::to_string),
+            stage_order,
+            tc_mod_key,
+            rgb_wave_key,
+            opaque_texture,
+            [
+                fog.range.x.to_bits(),
+                fog.range.y.to_bits(),
+                fog.range.z.to_bits(),
+                fog.range.w.to_bits(),
+                fog.color.x.to_bits(),
+                fog.color.y.to_bits(),
+                fog.color.z.to_bits(),
+                fog.color.w.to_bits(),
+            ],
+        );
+
+        if let Some(handle) = cache.get(&key) {
+            return Some(handle.clone());
+        }
+
+        let handle = ja_materials.add(JaMaterial {
+            tint,
+            texture: image,
+            params,
+            lightmap: lightmap_handle,
+            lightmap_enabled,
+            uv_offset: Vec2::ZERO,
+            tc_mods,
+            rgb_wave,
+            fog,
+            blend: blend_state,
+            alpha_mode,
+            depth_write,
+            cull: true,
+            stage_order,
+            transparent,
+        });
+
+        if tc_mod_count > 0 || rgb_wave.meta.x != 0 {
+            ja_tc_modulated.push(handle.clone());
+        }
+
+        cache.insert(key, handle.clone());
+        Some(handle)
+    }
+    fn ja_stage_material(
+        cache: &mut BTreeMap<
+            (
+                String,
+                String,
+                Surface,
+                [u32; 4],
+                [u32; 11],
+                [u32; 5],
+                bool,
+                bool,
+                bool,
+                bool,
+                u32,
+                bool,
+            ),
+            Handle<OdysseyMaterial>,
+        >,
+        textures: &BTreeMap<&'t str, Handle<Image>>,
+        irs: &BTreeMap<String, TextureIr>,
+        area: AreaLight,
+        stores: &mut Stores,
+        texture: &str,
+        lightmap: Option<&str>,
+        stage: &[Vec<String>],
+        surface: Surface,
+        environment: bool,
+        lighting: &Lighting,
+        // True when this stage will be spawned as an overlay on the base
+        // mesh (same geometry, `Transform::IDENTITY`), rather than as the
+        // base itself. Overlays must not write depth, or they z-fight the
+        // base into black triangles; a stage without a `blendFunc` parses
+        // as `Surface::Opaque` (depth-writing), so a `true` here swaps it
+        // to `Surface::Filter` (multiply, no depth write).
+        overlay: bool,
+        stage_order: u32,
+        force_vertex_color: bool,
+    ) -> Option<Handle<OdysseyMaterial>> {
+        let tint = Self::shader_stage_tint(stage);
+        let uses_vertex_color = force_vertex_color || Self::shader_stage_uses_vertex_color(stage);
+        let lightmap_stage = texture == "$lightmap";
+        let image_name = if lightmap_stage {
+            lightmap?
+        } else if textures.contains_key(texture) {
+            texture
+        } else {
+            // A shader name that isn't itself a texture (a sky): use its
+            // first stage's `map`, which names the texture to draw.
+            stage
+                .iter()
+                .find(|directive| directive.first().is_some_and(|name| name == "map"))
+                .and_then(|directive| directive.get(1))
+                .map(String::as_str)
+                .unwrap_or(texture)
+        };
+        let opaque_texture = !lightmap_stage
+            && irs
+                .get(image_name)
+                .is_some_and(|texture| !texture.facts.alpha);
+
+        // Animated stages must not alias merely because their first frame
+        // and render settings happen to match.
+        let animation_key = stage
+            .iter()
+            .filter(|directive| {
+                directive.first().is_some_and(|name| {
+                    name.eq_ignore_ascii_case("animMap")
+                        || name.eq_ignore_ascii_case("clampAnimMap")
+                        || (name.eq_ignore_ascii_case("tcMod")
+                            && directive
+                                .get(1)
+                                .is_some_and(|modifier| modifier.eq_ignore_ascii_case("scale")))
+                })
+            })
+            .map(|directive| directive.join(" "))
+            .collect::<Vec<_>>()
+            .join("|");
+
+        let ja_stage_fog = area
+            .fog
+            .as_ref()
+            .filter(|_| lighting.fogged)
+            .map(|fog| material::Fog {
+                color: fog.color,
+                near: fog.near,
+                far: fog.far,
+            });
+
+        let fog_key = ja_stage_fog
+            .as_ref()
+            .map(|fog| {
+                [
+                    fog.color[0].to_bits(),
+                    fog.color[1].to_bits(),
+                    fog.color[2].to_bits(),
+                    fog.near.to_bits(),
+                    fog.far.to_bits(),
+                ]
+            })
+            .unwrap_or([0; 5]);
+
+        let key = (
+            image_name.to_owned(),
+            animation_key,
+            surface,
+            tint.to_array().map(f32::to_bits),
+            lighting.bits(),
+            fog_key,
+            environment,
+            lightmap_stage,
+            overlay,
+            uses_vertex_color,
+            stage_order,
+            opaque_texture,
+        );
+        if let Some(material) = cache.get(&key) {
+            return Some(material.clone());
+        }
+
+        let sky_fog_colour = area
+            .fog
+            .as_ref()
+            .map(|fog| Vec4::new(fog.color[0], fog.color[1], fog.color[2], 1.0));
+        let image = textures.get(image_name).cloned();
+        let area = AreaLight::ambient(area.ambient);
+        let constant = stage.iter().any(|directive| {
+            directive.first().is_some_and(|name| name == "rgbGen")
+                && directive.get(1).is_some_and(|mode| mode == "const")
+        });
+
+        let (base, lightmap_image) = if lightmap_stage {
+            (None, image)
+        } else {
+            (image, None)
+        };
+        let sky =
+            base.is_none() && lightmap_image.is_none() && image_name.starts_with("textures/skies/");
+        let tint = if sky {
+            sky_fog_colour.unwrap_or(Vec4::new(0.53, 0.67, 0.84, 1.0))
+        } else {
+            tint
+        };
+        let surface = if sky {
+            Surface::Opaque
+        } else if overlay && surface == Surface::Opaque {
+            Surface::Filter
+        } else {
+            surface
+        };
+        let material =
+            OdysseyMaterial::new(tint, base, lightmap_image, None, surface, lighting, &area)
+                .ja_stage_order(stage_order)
+                .ja_stage_fog(ja_stage_fog)
+                .opaque_texture(opaque_texture);
+        let material = if uses_vertex_color {
+            material
+        } else {
+            material.ignore_vertex_color()
+        };
+
+        let material = if lightmap_stage {
+            material.lightmap_stage()
+        } else {
+            material
+        };
+
+        let material = if environment {
+            material.tcgen_environment()
+        } else {
+            material
+        };
+
+        let material = material.unlit_if(constant).ja_reverse_z();
+
+        // JA shaders with `rgbGen exactVertex` / `rgbGen vertex` multiply
+        // the diffuse by the mesh's per-vertex colour. On Hoth, most of
+        // the visible surfaces are `*_vertex` textures whose baked
+        // vertex colour is far darker than the raw texture; without this
+        // multiply they render at the raw brightness (or, where the
+        // vertex colour is dark enough, near black). KOTOR never sets
+        // `exactVertex`/`vertex` here, so this never fires for KOTOR.
+        let material = if uses_vertex_color {
+            material.ja_vertex_colour()
+        } else {
+            material
+        };
+
+        let material = stores.materials.add(material);
+        if !lightmap_stage && surface == Surface::Opaque && lighting.is_static {}
+        cache.insert(key, material.clone());
+        Some(material)
+    }
     /// One mesh of a model, hung from its node.
     fn mesh(
         &mut self,
@@ -1335,6 +2172,41 @@ impl<'t> Spawner<'t> {
         (placed, part, is_room, mesh_index): (&Placed, &asset_odyssey::model::MeshIr, bool, usize),
         nodes: &[Entity],
     ) -> Option<(Entity, AssetId<Mesh>, Handle<OdysseyMaterial>, bool)> {
+        let is_sky = placed.bsp.is_some()
+            && part
+                .texture
+                .as_deref()
+                .and_then(|name| self.ja_shader_ir.and_then(|shaders| shaders.get(name)))
+                .is_some_and(|shader| {
+                    shader.directives.iter().any(|directive| {
+                        matches!(
+                            &directive.kind,
+                            crate::ja_shader::ShaderDirectiveKind::SurfaceParm(value)
+                                if value.eq_ignore_ascii_case("sky")
+                        )
+                    })
+                });
+
+        let is_fog = placed.bsp.is_some()
+            && part.texture.as_deref().is_some_and(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.starts_with("textures/fogs/")
+                    || self
+                        .ja_shader_ir
+                        .and_then(|shaders| shaders.get(name))
+                        .is_some_and(|shader| {
+                            shader.directives.iter().any(|directive| {
+                                matches!(
+                                    &directive.kind,
+                                    crate::ja_shader::ShaderDirectiveKind::SurfaceParm(value)
+                                        if value.eq_ignore_ascii_case("fog")
+                                )
+                            })
+                        })
+            });
+        if is_fog {
+            return None;
+        }
         let tally = &mut self.tally;
         let textures = &self.textures;
         // A skinned mesh stays in main memory too: a cut reads it
@@ -1363,7 +2235,16 @@ impl<'t> Spawner<'t> {
             .lightmap
             .as_deref()
             .is_some_and(|name| textures.contains_key(name));
-        if texture.is_none() && !lightmap_loaded {
+        let has_ja_shader = placed.bsp.is_some()
+            && part.skin.is_none()
+            && part.dangly.is_none()
+            && self.ja_shaders.is_some_and(|shaders| {
+                part.texture
+                    .as_deref()
+                    .is_some_and(|name| shaders.contains_key(name))
+            });
+
+        if texture.is_none() && !lightmap_loaded && !has_ja_shader && !is_sky {
             tally.hidden += 1;
             return None;
         }
@@ -1417,6 +2298,33 @@ impl<'t> Spawner<'t> {
         // say nothing is drawn from both sides.
         //let culled = !facts.iter().all(|facts| facts.decal || facts.two_sided);
         let culled = false; // DEBUG: disable backface culling to test winding
+
+        // Resolve the BSP's global JA fog once, for both the base material
+        // and shader-stage materials. Local brush fog needs volume clipping.
+        let ja_fog = placed
+            .bsp
+            .as_ref()
+            .and_then(|bsp| bsp.mesh_fog.get(mesh_index))
+            .and_then(|index| usize::try_from(*index).ok())
+            .and_then(|index| self.ja_fogs.get(index))
+            .filter(|fog| fog.brush == -1 && fog.planes.is_empty())
+            .and_then(|fog| match (fog.color, fog.distance) {
+                (Some(color), Some(distance))
+                    if color.iter().all(|value| value.is_finite())
+                        && distance.is_finite()
+                        && distance > 0.0 =>
+                {
+                    let far = distance * asset_ja::UNIT;
+                    let near = far * 0.45;
+                    let visual_far = far * 1.0;
+                    Some(crate::ja_material::JaFogUniform {
+                        range: Vec4::new(near, visual_far, 0.0, 0.0),
+                        color: Vec4::new(color[0], color[1], color[2], 1.0),
+                    })
+                }
+                _ => None,
+            });
+
         let lighting = Lighting {
             self_illum: part.self_illum,
             ambient: part.ambient,
@@ -1424,13 +2332,24 @@ impl<'t> Spawner<'t> {
             alpha: part.alpha,
             is_static: placed.is_static,
             is_room,
-            fogged: placed.ir.affected_by_fog,
+            fogged: placed.ir.affected_by_fog || ja_fog.is_some(),
         };
 
+        let mut area = self.area;
+        if let Some(fog) = ja_fog {
+            area.fog = Some(material::Fog {
+                color: [fog.color.x, fog.color.y, fog.color.z],
+                near: fog.range.x,
+                far: fog.range.y,
+            });
+        }
+
         // Shader-stage overlays are currently limited to ordinary BSP meshes.
+        let ja_fog = ja_fog.unwrap_or_default();
+
         let shader_stages = if placed.bsp.is_some() && part.skin.is_none() && part.dangly.is_none()
         {
-            Self::shader_stages(self.ja_shaders, part.texture.as_deref())
+            Self::shader_stages(self.ja_shaders, self.ja_shader_ir, part.texture.as_deref())
         } else {
             Vec::new()
         };
@@ -1455,7 +2374,7 @@ impl<'t> Spawner<'t> {
         if surface == Surface::Additive && part.transparency_hint == 0 {
             tally.additive_without_hint += 1;
         }
-        let area = self.area;
+        let white = self.white.clone();
         let material = self
             .cache
             .entry((
@@ -1467,6 +2386,16 @@ impl<'t> Spawner<'t> {
                 part.uv_scroll.map(|dir| dir.map(f32::to_bits)),
                 culled,
                 whole,
+                area.fog.map(|fog| {
+                    [
+                        fog.color[0].to_bits(),
+                        fog.color[1].to_bits(),
+                        fog.color[2].to_bits(),
+                        fog.near.to_bits(),
+                        fog.far.to_bits(),
+                    ]
+                }),
+                is_sky,
             ))
             .or_insert_with(|| {
                 let handle = |name: Option<&str>| name.and_then(|name| textures.get(name).cloned());
@@ -1477,8 +2406,18 @@ impl<'t> Spawner<'t> {
                     .is_some_and(|texture| !texture.facts.alpha);
                 let made = |surface| {
                     OdysseyMaterial::new(
-                        Vec4::ONE,
-                        handle(texture),
+                        if is_sky {
+                            area.fog.map_or(Vec4::new(0.53, 0.67, 0.84, 1.0), |fog| {
+                                Vec4::new(fog.color[0], fog.color[1], fog.color[2], 1.0)
+                            })
+                        } else {
+                            Vec4::ONE
+                        },
+                        if is_sky {
+                            Some(white.clone())
+                        } else {
+                            handle(texture)
+                        },
                         handle(lightmap),
                         handle(envmap.filter(|_| !sphere)),
                         surface,
@@ -1488,6 +2427,8 @@ impl<'t> Spawner<'t> {
                     .sphere_envmap(handle(envmap.filter(|_| sphere)))
                     .opaque_texture(opaque)
                     .culled(culled)
+                    .unlit_if(is_sky)
+                    .ignore_vertex_color_if(is_sky)
                 };
                 let material = match whole {
                     Some(whole) => made(surface).whole_as(&made(whole)),
@@ -1496,6 +2437,178 @@ impl<'t> Spawner<'t> {
                 stores.materials.add(material)
             })
             .clone();
+        // The base stage is the one with no blendFunc, unless the shader
+        // opens with `$lightmap` followed by a `filter` stage (the JA
+        // lightmap-pair optimised shader): then the lightmap base is
+        // stages 0-1 together and everything from index 2 on is an
+        // overlay. Otherwise only stages after the first are overlays.
+        // Overlays only exist when there is a base to layer onto, so a
+        // shader whose first stage is *not* `$lightmap` and whose first
+        // stage has no lightmap keeps every stage as its own base â€” the
+        // original Opaque material, not the Filter fallback.
+        // The JA `$lightmap, filter` pair can be at any position in the
+        // stage list, not just the first two: `s_metalc_dark`-shaped
+        // shaders put it after an env stage and the base. Find it wherever
+        // it is; the pair itself is folded into the `OdysseyMaterial`'s
+        // lightmap multiply (see `base_material` below).
+        let has_lightmap_pair = shader_stages
+            .get(0)
+            .is_some_and(|stage| stage.1 == "$lightmap")
+            && shader_stages
+                .get(1)
+                .is_some_and(|stage| stage.3 == Surface::Filter);
+
+        // Render every JA lightmap-pair stage independently, in shader order.
+        let lightmap_pair = has_lightmap_pair && lightmap.is_some();
+        let unlit_lightmap_pair = has_lightmap_pair && lightmap.is_none();
+
+        // The base is the first drawable opaque stage. The JA lightmap pair
+        // retains its special handling: its base is stages 0-1 together
+        // when lit, or stage 1 when no lightmap is available.
+        let base_stage_index = if lightmap_pair {
+            0
+        } else if unlit_lightmap_pair {
+            1
+        } else {
+            shader_stages
+                .iter()
+                .position(|(_, name, _, stage_surface, _)| {
+                    !name.is_empty() && *stage_surface == Surface::Opaque
+                })
+                .unwrap_or(0)
+        };
+
+        enum JaStageMaterial {
+            Ja(Handle<crate::ja_material::JaMaterial>),
+            Odyssey(Handle<OdysseyMaterial>),
+        }
+
+        let mut stage_materials: Vec<(u32, JaStageMaterial)> = Vec::new();
+
+        for (index, (typed, name, stage, stage_surface, environment)) in
+            shader_stages.iter().enumerate()
+        {
+            // Skip the `$lightmap` stage itself; the `filter` stage after it
+            // is the base and must be spawned.
+            if (lightmap_pair && index < 2) || (unlit_lightmap_pair && index == 0) {
+                continue;
+            }
+
+            let stage_order = index as u32;
+
+            // Preserve the known-good animated keyboard panels:
+            // the final alpha-blended stage was obscuring their animation.
+            if part.texture.as_deref() == Some("textures/doomgiver/control_panel_02")
+                && stage_order == 3
+            {
+                continue;
+            }
+
+            let stage_surface = if unlit_lightmap_pair && index == base_stage_index {
+                Surface::Opaque
+            } else {
+                *stage_surface
+            };
+
+            let unlit_base = unlit_lightmap_pair && index == base_stage_index;
+            let ja_stage = typed.and_then(|typed| {
+                Self::ja_stage_new_material(
+                    &mut self.ja_material_cache,
+                    stores.ja_materials,
+                    &self.textures,
+                    self.irs,
+                    typed,
+                    lightmap,
+                    stage_order,
+                    unlit_base,
+                    ja_fog,
+                    &mut self.ja_tc_modulated,
+                )
+            });
+            if let Some(handle) = ja_stage {
+                stage_materials.push((stage_order, JaStageMaterial::Ja(handle)));
+                continue;
+            }
+
+            // Fallback: draw the stage with OdysseyMaterial when ja.wgsl
+            // cannot handle it exactly (rgbGen wave, tcMod, animMap, tcGen
+            // environment, alphaGen). Frozen at a constant tint, but in the
+            // right place and on the right surface, so overlays still show.
+            if let Some((_, name, raw, stage_surface, environment)) = shader_stages.get(index) {
+                let overlay = index != base_stage_index;
+                if let Some(handle) = Self::ja_stage_material(
+                    &mut self.ja_stage_cache,
+                    &self.textures,
+                    self.irs,
+                    area,
+                    stores,
+                    name,
+                    lightmap,
+                    raw,
+                    *stage_surface,
+                    *environment,
+                    &lighting,
+                    overlay,
+                    stage_order,
+                    false,
+                ) {
+                    eprintln!(
+                        "JA OVERLAY: tex={:?} stage={} surface={:?} lightmap={:?}",
+                        part.texture, stage_order, surface, lightmap,
+                    );
+                    stage_materials.push((stage_order, JaStageMaterial::Odyssey(handle.clone())));
+
+                    if let Some(typed) = typed {
+                        for directive in &typed.directives {
+                            let animation = match &directive.kind {
+                                crate::ja_shader::StageDirectiveKind::Map(
+                                    crate::ja_shader::TextureMap::AnimMap { frequency, frames }
+                                    | crate::ja_shader::TextureMap::ClampAnimMap {
+                                        frequency,
+                                        frames,
+                                    },
+                                ) => Some((*frequency, frames.as_slice())),
+                                _ => None,
+                            };
+
+                            if let Some((frequency, names)) = animation {
+                                eprintln!(
+                                    "JA ANIM CHECK: stage={} frequency={:?} frames={:?} resolved={}",
+                                    stage_order,
+                                    frequency,
+                                    names,
+                                    names
+                                        .iter()
+                                        .filter(|name| self.textures.contains_key(name.as_str()))
+                                        .count()
+                                );
+                            }
+
+                            if let Some((Some(fps), names)) = animation
+                                && fps > 0.0
+                                && !self
+                                    .flipbooks
+                                    .iter()
+                                    .any(|(existing, _, _)| *existing == handle)
+                            {
+                                let frames = names
+                                    .iter()
+                                    .map(|name| self.textures.get(name.as_str()).cloned())
+                                    .collect::<Option<Vec<_>>>();
+
+                                if let Some(frames) = frames
+                                    && frames.len() > 1
+                                {
+                                    self.flipbooks.push((handle.clone(), frames, fps));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !stage_materials.is_empty() {}
 
         if let Some((handles, fps)) = texture.and_then(|name| self.frames.get(name))
             && !self
@@ -1527,18 +2640,60 @@ impl<'t> Spawner<'t> {
             let pieces = see_through_pieces(&part.positions, &part.indices);
             if pieces.len() > 1 {
                 for piece in &pieces {
-                    let mesh = odyssey_mesh(part, usage, lightmap.is_some(), Some(piece));
+                    let mesh_handle = stores.meshes.add(odyssey_mesh(
+                        part,
+                        usage,
+                        lightmap.is_some(),
+                        Some(piece),
+                    ));
+
                     let child = commands
                         .spawn((
-                            Mesh3d(stores.meshes.add(mesh)),
+                            Mesh3d(mesh_handle.clone()),
                             MeshMaterial3d(material.clone()),
                             Transform::IDENTITY,
                         ))
                         .id();
+
                     if let Some(room) = self.room {
                         commands.entity(child).insert(room_tag(room));
                     }
                     commands.entity(nodes[part.node]).add_child(child);
+
+                    for (order, stage_material) in &stage_materials {
+                        if !lightmap_pair && *order == base_stage_index as u32 {
+                            continue;
+                        }
+                        let overlay_child = match stage_material {
+                            JaStageMaterial::Ja(handle) => commands
+                                .spawn((
+                                    Mesh3d(mesh_handle.clone()),
+                                    MeshMaterial3d(handle.clone()),
+                                    Transform::IDENTITY,
+                                ))
+                                .id(),
+                            JaStageMaterial::Odyssey(handle) => commands
+                                .spawn((
+                                    Mesh3d(mesh_handle.clone()),
+                                    MeshMaterial3d(handle.clone()),
+                                    Transform::IDENTITY,
+                                ))
+                                .id(),
+                        };
+                        if let Some(bsp) = placed.bsp.as_ref()
+                            && let Some(&surface) = bsp.mesh_surface.get(mesh_index)
+                        {
+                            commands.entity(overlay_child).insert(BspMesh {
+                                surface,
+                                fog: bsp.mesh_fog.get(mesh_index).copied().unwrap_or(-1),
+                                is_sky,
+                            });
+                        }
+                        if let Some(room) = self.room {
+                            commands.entity(overlay_child).insert(room_tag(room));
+                        }
+                        commands.entity(nodes[part.node]).add_child(overlay_child);
+                    }
                 }
                 tally.drawn += 1;
                 tally.split[0] += 1;
@@ -1565,11 +2720,40 @@ impl<'t> Spawner<'t> {
         if part.dangly.is_some() {
             mesh = crate::dangly::with_previous(mesh);
         }
-        let mesh = stores.meshes.add(mesh);
-        let spawned = (mesh.id(), material.clone());
-        let child = commands
-            .spawn((Mesh3d(mesh), MeshMaterial3d(material), Transform::IDENTITY))
-            .id();
+        let mesh_handle = stores.meshes.add(mesh);
+        let spawned = (mesh_handle.id(), material.clone());
+        let base_material = if lightmap_pair {
+            None
+        } else {
+            stage_materials
+                .iter()
+                .find(|(order, _)| *order == base_stage_index as u32)
+                .map(|(_, material)| material)
+        };
+
+        let child = match base_material {
+            Some(JaStageMaterial::Ja(handle)) => commands
+                .spawn((
+                    Mesh3d(mesh_handle.clone()),
+                    MeshMaterial3d(handle.clone()),
+                    Transform::IDENTITY,
+                ))
+                .id(),
+            Some(JaStageMaterial::Odyssey(handle)) => commands
+                .spawn((
+                    Mesh3d(mesh_handle.clone()),
+                    MeshMaterial3d(handle.clone()),
+                    Transform::IDENTITY,
+                ))
+                .id(),
+            None => commands
+                .spawn((
+                    Mesh3d(mesh_handle.clone()),
+                    MeshMaterial3d(material.clone()),
+                    Transform::IDENTITY,
+                ))
+                .id(),
+        };
         if let Some(room) = self.room {
             commands.entity(child).insert(room_tag(room));
             // A solid room mesh stops a fight's light under Ultra. A mesh
@@ -1595,7 +2779,11 @@ impl<'t> Spawner<'t> {
         if let Some(bsp) = placed.bsp.as_ref()
             && let Some(&surface) = bsp.mesh_surface.get(mesh_index)
         {
-            commands.entity(child).insert(BspMesh { surface });
+            commands.entity(child).insert(BspMesh {
+                surface,
+                fog: bsp.mesh_fog.get(mesh_index).copied().unwrap_or(-1),
+                is_sky,
+            });
         }
         if let Some(dangly) = &part.dangly {
             commands
@@ -1645,6 +2833,43 @@ impl<'t> Spawner<'t> {
             self.solid = true;
         }
         commands.entity(nodes[part.node]).add_child(child);
+        for (order, stage_material) in &stage_materials {
+            if !lightmap_pair && *order == base_stage_index as u32 {
+                continue;
+            }
+            let overlay_child = match stage_material {
+                JaStageMaterial::Ja(handle) => commands
+                    .spawn((
+                        Mesh3d(mesh_handle.clone()),
+                        MeshMaterial3d(handle.clone()),
+                        Transform::IDENTITY,
+                    ))
+                    .id(),
+                JaStageMaterial::Odyssey(handle) => commands
+                    .spawn((
+                        Mesh3d(mesh_handle.clone()),
+                        MeshMaterial3d(handle.clone()),
+                        Transform::IDENTITY,
+                    ))
+                    .id(),
+            };
+
+            if let Some(bsp) = placed.bsp.as_ref()
+                && let Some(&surface) = bsp.mesh_surface.get(mesh_index)
+            {
+                commands.entity(overlay_child).insert(BspMesh {
+                    surface,
+                    fog: bsp.mesh_fog.get(mesh_index).copied().unwrap_or(-1),
+                    is_sky,
+                });
+            }
+
+            if let Some(room) = self.room {
+                commands.entity(overlay_child).insert(room_tag(room));
+            }
+            commands.entity(nodes[part.node]).add_child(overlay_child);
+        }
+
         tally.drawn += 1;
         Some((child, spawned.0, spawned.1, skinned.is_some()))
     }
@@ -1891,6 +3116,9 @@ pub(crate) fn spawn_scene(
     let mut spawner = Spawner::with_ja_shaders(
         &loaded.textures,
         &loaded.ja_shaders,
+        &loaded.ja_shader_ir,
+        &loaded.ja_fogs,
+        loaded.skybox.is_some(),
         loaded.area_light(),
         images,
     );
@@ -2315,10 +3543,32 @@ fn cull_rooms(
         return;
     }
     let eye = game_to_bevy().inverse() * camera.translation;
-    let current = culling.eye_rooms(all, eye);
-    let fog_far = scene.0.fog.as_ref().map_or(f32::INFINITY, |fog| fog.far);
+    let is_ja = scene.0.is_ja;
+    let current = if is_ja {
+        room_at(all, eye.x, eye.y).map(|room| vec![room])
+    } else {
+        culling.eye_rooms(all, eye)
+    };
+    let fog_far = if is_ja {
+        scene.0.fog.as_ref().map_or_else(
+            || {
+                scene
+                    .0
+                    .ja_fogs
+                    .iter()
+                    .filter(|fog| fog.brush == -1 && fog.planes.is_empty())
+                    .filter_map(|fog| fog.distance)
+                    .filter(|d| d.is_finite() && *d > 0.0)
+                    .map(|d| d * 1.5 * asset_ja::UNIT)
+                    .fold(f32::INFINITY, f32::max)
+            },
+            |fog| fog.far,
+        )
+    } else {
+        scene.0.fog.as_ref().map_or(f32::INFINITY, |fog| fog.far)
+    };
     let shown: Vec<bool> = (0..all.len())
-        .map(|index| culling.room_visible(all, current.as_deref(), eye, fog_far, index))
+        .map(|index| culling.room_visible(all, current.as_deref(), eye, fog_far, is_ja, index))
         .collect();
     if shown == culling.shown {
         return;
@@ -2362,18 +3612,63 @@ fn cull_rooms(
 fn cull_bsp(
     vis: Res<BspCulling>,
     cameras: Query<&Transform, With<FlyCamera>>,
-    mut meshes: Query<(&BspMesh, &mut Visibility)>,
+    mut meshes: Query<(&BspMesh, Option<&Aabb>, &GlobalTransform, &mut Visibility)>,
 ) {
     let Some(bsp) = &vis.vis else { return };
     let Ok(camera) = cameras.single() else { return };
-    // Camera in game space, metres; the PVS expects the original Q3 units.
     let eye_m = game_to_bevy().inverse() * camera.translation;
     let eye_q3 = (eye_m / asset_ja::UNIT).to_array();
     let Some(cluster) = bsp.visibility.cluster_for_point(eye_q3) else {
         return;
     };
-    for (mesh, mut visibility) in &mut meshes {
-        let visible = bsp.visibility.is_surface_visible(cluster, mesh.surface);
+
+    static LAST_SKY_TRACE_CLUSTER: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    let trace_sky_cluster = LAST_SKY_TRACE_CLUSTER
+        .swap(cluster as usize, std::sync::atomic::Ordering::Relaxed)
+        != cluster as usize;
+
+    if trace_sky_cluster {
+        eprintln!("SKY PVS TRACE: camera cluster={cluster}");
+    }
+
+    const NEAR_CULL: f32 = 80.0;
+    let eye_bevy = camera.translation;
+
+    let mut shown = 0usize;
+    let mut culled = 0usize;
+    let mut near_forced = 0usize;
+    let mut no_aabb = 0usize;
+
+    for (mesh, aabb, xform, mut visibility) in &mut meshes {
+        let near = aabb
+            .map(|aabb| (xform.transform_point(aabb.center.into()) - eye_bevy).length() < NEAR_CULL)
+            .unwrap_or(false);
+        if aabb.is_none() {
+            no_aabb += 1;
+        }
+        let visible =
+            mesh.is_sky || near || bsp.visibility.is_surface_visible(cluster, mesh.surface);
+
+        if trace_sky_cluster && (8935..=8939).contains(&mesh.surface) {
+            eprintln!(
+                "SKY PVS SURFACE {}: pvs={} near={} visible={}",
+                mesh.surface,
+                bsp.visibility.is_surface_visible(cluster, mesh.surface),
+                near,
+                visible,
+            );
+        }
+
+        if near && !bsp.visibility.is_surface_visible(cluster, mesh.surface) {
+            near_forced += 1;
+        }
+        if visible {
+            shown += 1;
+        } else {
+            culled += 1;
+        }
         visibility.set_if_neq(if visible {
             Visibility::Inherited
         } else {
@@ -2381,7 +3676,6 @@ fn cull_bsp(
         });
     }
 }
-
 /// The lights that come and go beside the scene's own, as `pick_lights`
 /// takes them: carried, bodies', shots', blades' and the powers'.
 type MovingLights<'w> = (
@@ -2520,7 +3814,7 @@ pub(crate) fn animation_seconds(time: &Time, held: &AnimationTime) -> f32 {
 }
 
 /// A surface's scrolling texture, as reone has it: the offset moves by
-/// `250 × direction` per second and wraps to [0, 1). Computed from the
+/// `250 Ã— direction` per second and wraps to [0, 1). Computed from the
 /// animation time rather than stepped, so a held time gives the same frame.
 fn scroll_uvs(
     time: Res<Time>,
@@ -2528,6 +3822,17 @@ fn scroll_uvs(
     mut moving: ResMut<AnimatedMaterials>,
     (mut materials, mut animated): (ResMut<Assets<OdysseyMaterial>>, ResMut<material::Animated>),
 ) {
+    if !moving.flipbooks.is_empty() {
+        eprintln!(
+            "JA FLIPBOOK PRUNE: before={} present={}",
+            moving.flipbooks.len(),
+            moving
+                .flipbooks
+                .iter()
+                .filter(|(id, ..)| materials.contains(*id))
+                .count()
+        );
+    }
     moving.prune(&materials);
     animated.prune(&materials);
     let seconds = animation_seconds(&time, &held);
@@ -2554,12 +3859,32 @@ fn forget_animated(mut animated: ResMut<material::Animated>) {
 /// Diffuse flip-books. Neither reference animates a diffuse flip-book;
 /// this uses the timing of reone's bump-map cycle: the
 /// cycle lasts `frames / fps`, and the frame is
-/// `round((frames - 1) × time / length)`.
+/// `round((frames - 1) Ã— time / length)`.
+fn animate_ja_tc_mods(
+    time: Res<Time>,
+    held: Res<AnimationTime>,
+    mut moving: ResMut<AnimatedMaterials>,
+    mut materials: ResMut<Assets<crate::ja_material::JaMaterial>>,
+) {
+    moving.ja_tc_modulated.retain(|id| materials.contains(*id));
+
+    let seconds = animation_seconds(&time, &held);
+    for &handle in &moving.ja_tc_modulated {
+        if materials
+            .get(handle)
+            .is_some_and(|material| material.tc_mods.time_count.x != seconds)
+            && let Some(mut material) = materials.get_mut(handle)
+        {
+            material.tc_mods.time_count.x = seconds;
+        }
+    }
+}
 fn cycle_flipbooks(
     time: Res<Time>,
     held: Res<AnimationTime>,
     moving: Res<AnimatedMaterials>,
     mut materials: ResMut<Assets<OdysseyMaterial>>,
+    images: Res<Assets<Image>>,
     (mut facts, dump_due): (ResMut<console::DumpFacts>, Res<console::DumpDue>),
 ) {
     if dump_due.0 {
@@ -2570,14 +3895,82 @@ fn cycle_flipbooks(
         );
     }
     for &(handle, ref frames, fps) in &moving.flipbooks {
-        let frame = flipbook_frame(frames.len(), fps, animation_seconds(&time, &held));
+        let seconds = animation_seconds(&time, &held);
+        let frame = flipbook_frame(frames.len(), fps, seconds);
+        eprintln!(
+            "JA FLIPBOOK TICK: seconds={seconds:.3} frame={frame} fps={fps} frames={}",
+            frames.len()
+        );
+        if frame == 0 {
+            for (i, image_handle) in frames.iter().enumerate() {
+                if let Some(image) = images.get(image_handle) {
+                    let hash = image.data.as_ref().map(|data| {
+                        data.iter().fold(0xcbf29ce484222325u64, |h, b| {
+                            (h ^ (*b as u64)).wrapping_mul(0x100000001b3)
+                        })
+                    });
+                    eprintln!(
+                        "JA FRAME IMAGE: index={i} size={}x{} bytes={} hash={hash:?}",
+                        image.texture_descriptor.size.width,
+                        image.texture_descriptor.size.height,
+                        image.data.as_ref().map_or(0, Vec::len)
+                    );
+                }
+            }
+        }
+        if frame == 0 {
+            for (i, image_handle) in frames.iter().enumerate() {
+                if let Some(image) = images.get(image_handle) {
+                    let hash = image.data.as_ref().map(|data| {
+                        data.iter().fold(0xcbf29ce484222325u64, |h, b| {
+                            (h ^ (*b as u64)).wrapping_mul(0x100000001b3)
+                        })
+                    });
+                    eprintln!(
+                        "JA FRAME IMAGE: index={i} size={}x{} bytes={} hash={hash:?}",
+                        image.texture_descriptor.size.width,
+                        image.texture_descriptor.size.height,
+                        image.data.as_ref().map_or(0, Vec::len)
+                    );
+                }
+            }
+        }
         let wanted = &frames[frame];
-        if materials
+        let wanted_id = wanted.id();
+        let current_id = materials
             .get(handle)
-            .is_some_and(|material| material.base.as_ref() != Some(wanted))
-            && let Some(mut material) = materials.get_mut(handle)
-        {
-            material.base = Some(wanted.clone());
+            .and_then(|material| material.base.as_ref().map(|image| image.id()));
+
+        if seconds < 0.6 {
+            let frame_ids = frames
+                .iter()
+                .map(|image| format!("{:?}", image.id()))
+                .collect::<Vec<_>>();
+
+            eprintln!(
+                "JA FLIPBOOK IDS: seconds={seconds:.3} frame={frame} material={:?} current={current_id:?} wanted={wanted_id:?} frames={frame_ids:?}",
+                handle
+            );
+        }
+
+        if current_id != Some(wanted_id) {
+            eprintln!(
+                "JA FLIPBOOK UPDATE: material={:?} frame={} current={:?} wanted={:?}",
+                handle, frame, current_id, wanted_id
+            );
+
+            if let Some(mut material) = materials.get_mut(handle) {
+                material.base = Some(wanted.clone());
+                eprintln!(
+                    "JA FLIPBOOK ASSIGNED: material={:?} frame={} image={:?}",
+                    handle, frame, wanted_id
+                );
+            } else {
+                eprintln!(
+                    "JA FLIPBOOK UPDATE FAILED: material={:?} no longer exists",
+                    handle
+                );
+            }
         }
     }
 }
@@ -2661,7 +4054,7 @@ pub(crate) fn animator(
     unbound(&placed.ir, clip)?.bind(nodes)
 }
 
-/// A clip's pose, as reone computes it: position = rest + scale × key, the
+/// A clip's pose, as reone computes it: position = rest + scale Ã— key, the
 /// orientation the key's; nodes without a key keep their rest pose.
 fn animate(
     time: Res<Time>,
@@ -3026,6 +4419,33 @@ fn follow_paths(
 /// lightmap's UVs when `lightmapped`; every triangle, or only `piece`'s
 /// (corner indices into `part.positions`), its vertices numbered anew so
 /// the mesh's bounds are the piece's.
+
+/// Reverse every triangle whose geometric winding (`cross(b - a, c - a)`)
+/// faces away from the average of its corners' normals. JA BSP brushes ship
+/// with mixed winding; the vertex normals always point outward, so this
+/// makes both windings agree with the surface the mapper drew.
+fn flip_to_normals(indices: &[u32], positions: &[[f32; 3]], normals: &[[f32; 3]]) -> Vec<u32> {
+    if indices.len() % 3 != 0 || normals.len() != positions.len() {
+        return indices.to_vec();
+    }
+    let mut out = Vec::with_capacity(indices.len());
+    for tri in indices.chunks_exact(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let pa = Vec3::from_array(positions[a]);
+        let pb = Vec3::from_array(positions[b]);
+        let pc = Vec3::from_array(positions[c]);
+        let geo = (pb - pa).cross(pc - pa);
+        let n = Vec3::from_array(normals[a])
+            + Vec3::from_array(normals[b])
+            + Vec3::from_array(normals[c]);
+        if geo.dot(n) < 0.0 {
+            out.extend_from_slice(&[tri[0], tri[2], tri[1]]);
+        } else {
+            out.extend_from_slice(tri);
+        }
+    }
+    out
+}
 fn odyssey_mesh(
     part: &asset_odyssey::model::MeshIr,
     usage: RenderAssetUsages,
@@ -3064,7 +4484,17 @@ fn odyssey_mesh(
     if lightmapped {
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, pick(&part.uv2, &vertices));
     }
-    mesh.insert_indices(Indices::U32(indices));
+    if part.colours.len() == count {
+        // JA vertex colour (see `MeshIr::colours`). Absent for KOTOR
+        // meshes; absent for JA meshes whose shader does not read it.
+        let colours: Vec<[f32; 4]> = pick(&part.colours, &vertices);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+    }
+    mesh.insert_indices(Indices::U32(flip_to_normals(
+        &indices,
+        &part.positions,
+        &part.normals,
+    )));
     mesh
 }
 

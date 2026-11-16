@@ -40,6 +40,7 @@ fn field_model() -> ModelIr {
             normals: Vec::new(),
             uv1: Vec::new(),
             uv2: Vec::new(),
+            colours: Vec::new(),
             indices: Vec::new(),
             texture: None,
             lightmap: None,

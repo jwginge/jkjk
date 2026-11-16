@@ -110,6 +110,7 @@ pub(crate) fn mesh(texture: &str) -> MeshIr {
         normals: Vec::new(),
         uv1: Vec::new(),
         uv2: Vec::new(),
+        colours: Vec::new(),
         indices: Vec::new(),
         texture: Some(texture.into()),
         lightmap: None,

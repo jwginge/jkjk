@@ -950,6 +950,7 @@ fn floor() -> (ModelIr, asset_odyssey::texture::TextureIr) {
             normals: vec![[0.0, 0.0, 1.0]; 4],
             uv1: vec![[0.0, 0.0], [half, 0.0], [half, half], [0.0, half]],
             uv2: Vec::new(),
+            colours: Vec::new(),
             indices: vec![0, 1, 2, 0, 2, 3],
             texture: Some(FLOOR_TEXTURE.into()),
             lightmap: None,

@@ -142,6 +142,7 @@ pub fn model(glm: &Glm, gla: &Gla, skin: &BTreeMap<String, String>) -> ModelIr {
             normals: surface.normals.clone(),
             uv1: surface.uvs.clone(),
             uv2: Vec::new(),
+            colours: Vec::new(),
             indices: surface.triangles.iter().flatten().copied().collect(),
             texture: (!texture.is_empty()).then_some(texture),
             lightmap: None,

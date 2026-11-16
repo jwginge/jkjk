@@ -39,6 +39,7 @@ struct OdysseyParams {
     fog_color: vec4<f32>,
     fog_range: vec4<f32>,
     uv_offset: vec2<f32>,
+    uv_scale: vec2<f32>,
     flags: u32,
     // Its slot of `animated` (`material::Animated`); 0 for none.
     slot: u32,
@@ -193,7 +194,7 @@ const BOX_CASTS: u32 = 1u;
 const NO_TILE: u32 = 0xffffffffu;
 
 // Flags: see `material.rs`.
-const TCGEN_ENVIRONMENT: u32 = 32768u;
+const TCGEN_ENVIRONMENT: u32 = 524288u;
 const DISCARD_ZERO_ALPHA: u32 = 1u;
 const OPAQUE_ALPHA: u32 = 2u;
 const ENVMAP: u32 = 4u;
@@ -208,11 +209,14 @@ const SHADOWED: u32 = 1024u;
 const ROOM: u32 = 2048u;
 const RECOLOUR: u32 = 4096u;
 const SPHERE_ENVMAP: u32 = 8192u;
+const JA_VERTEX_COLOUR: u32 = 262144u;
 // Lit evenly (a mine's dome): the area's ambient whatever the mesh's
 // ambient colour, and every lamp's light whichever way the surface faces.
 const EVEN_LIGHT: u32 = 16384u;
 // A model of an area, lit by the light probes under Enhanced lighting.
 const PROBED: u32 = 32768u;
+const LIGHTMAP_STAGE: u32 = 65536u;
+const IGNORE_VERTEX_COLOR: u32 = 131072u;
 const LIGHT_DYNAMIC_TYPE_ALL: u32 = 1u;
 // `GpuLight::kind.z` of a fight's light (`material::LIGHT_COMBAT`).
 const LIGHT_COMBAT: u32 = 1u;
@@ -1507,7 +1511,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let moving = animated[params.slot];
     let tint = vec4<f32>(params.tint.rgb, params.tint.a * moving.illum_alpha.a);
 #ifdef VERTEX_UVS_A
-    var uv = in.uv + params.uv_offset + moving.uv.xy;
+    var uv = (in.uv * params.uv_scale) + params.uv_offset + moving.uv.xy;
 #else
     let uv = vec2<f32>(0.0);
 #endif
@@ -1558,6 +1562,9 @@ if (params.flags & TCGEN_ENVIRONMENT) != 0u {
         return ray_debug(in.world_position.xyz, base.rgb, select(1u, 2u, shadows.debug == 6u));
     }
 #endif
+    if (params.flags & LIGHTMAP_STAGE) != 0u {
+        return vec4<f32>(lightmap, 1.0);
+    }
     let self_lit = select(params.self_illum.rgb, moving.illum_alpha.rgb, moving.uv.z > 0.5);
     // Ambient occlusion (`ambient_occlusion`) darkens the room's light: the
     // area's flat ambient, the light probes' light and, at a lower share,
@@ -1821,18 +1828,25 @@ if (params.flags & TCGEN_ENVIRONMENT) != 0u {
     // same), so Dantooine's crystals (alpha 0.9, DXT5 masks) stay solid.
     let coverage = select(base.a, tint.a, (params.flags & ENVMAP) != 0u);
     var alpha = select(coverage, 1.0, (params.flags & OPAQUE_ALPHA) != 0u);
-#ifdef VERTEX_COLORS
-    // Effect primitives carry a colour and fading alpha per vertex (the
-    // saber trail); on additive surfaces the alpha scales what is added,
-    // on vertex-alpha ones it fades the blend.
-    if (params.flags & VERTEX_ALPHA) != 0u {
+    // A JA stage with `rgbGen exactVertex` / `rgbGen vertex`: multiply the
+    // diffuse by the mesh's per-vertex colour. Alpha is left alone (KOTOR
+    // is what `VERTEX_ALPHA` is for, and it may be set on top).
+        if (params.flags & JA_VERTEX_COLOUR) != 0u {
         colour = colour * in.color.rgb;
-        alpha = alpha * in.color.a;
-    } else {
-        colour = colour * in.color.rgb * in.color.a;
     }
-#endif
-    // Alpha 0 (the vertex's included: a punch-through particle faded out)
+#ifdef VERTEX_COLORS
+    if (params.flags & IGNORE_VERTEX_COLOR) == 0u
+        && (params.flags & JA_VERTEX_COLOUR) == 0u {        // Effect primitives carry a colour and fading alpha per vertex.
+        // On additive surfaces the alpha scales what is added;
+        // on vertex-alpha ones it fades the blend.
+        if (params.flags & VERTEX_ALPHA) != 0u {
+            colour = colour * in.color.rgb;
+            alpha = alpha * in.color.a;
+        } else {
+            colour = colour * in.color.rgb * in.color.a;
+        }
+    }
+#endif    // Alpha 0 (the vertex's included: a punch-through particle faded out)
     // hides nothing behind it.
     if (params.flags & DISCARD_ZERO_ALPHA) != 0u && alpha == 0.0 {
         discard;

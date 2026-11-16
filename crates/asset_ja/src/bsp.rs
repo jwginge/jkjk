@@ -27,15 +27,106 @@ const PATCH_SUBDIVISIONS: usize = 8;
 /// Visibility and mesh-to-surface mapping for a converted BSP map.
 #[derive(Debug, Clone)]
 pub struct BspVis {
-    /// The BSP's PVS and spatial tree.
     pub visibility: JaVisibility,
-    /// `mesh_surface[i]` is the original BSP surface that produced mesh `i`.
     pub mesh_surface: Vec<usize>,
-    /// `mesh_shaders[i]` is the shader record used by mesh `i`.
-    pub mesh_shaders: Vec<bsp::BspShader>,
-    /// Embedded lightmaps, keyed by their generated name.
+    /// Raw BSP fog-lump index for each converted mesh; -1 means no fog.
+    pub mesh_fog: Vec<i32>,
     pub lightmaps: BTreeMap<String, TextureIr>,
+    pub entities: Vec<BTreeMap<String, String>>,
 }
+
+/// A Quake 3 / Jedi Academy entity lump, parsed into one map per entity.
+///
+/// The lump is a sequence of `{ "key" "value" "key" "value" ... }` records
+/// with whitespace between tokens and `//` line comments. Keys and values
+/// are double-quoted. Unknown directives are skipped as empty records so
+/// the caller never has to care about formatting quirks.
+pub fn parse_entities(raw: &[u8]) -> Vec<BTreeMap<String, String>> {
+    let text = String::from_utf8_lossy(raw);
+    let mut out: Vec<BTreeMap<String, String>> = Vec::new();
+    let mut current: Option<BTreeMap<String, String>> = None;
+    let mut tokens: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let line = match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        };
+        let mut buf = String::new();
+        let mut in_quote = false;
+        for c in line.chars() {
+            match c {
+                '"' => in_quote = !in_quote,
+                c if !in_quote && c.is_whitespace() => {
+                    if !buf.is_empty() {
+                        tokens.push(std::mem::take(&mut buf));
+                    }
+                }
+                c => buf.push(c),
+            }
+        }
+        if !buf.is_empty() {
+            tokens.push(buf);
+        }
+    }
+
+    let mut tokens = tokens.into_iter();
+    while let Some(tok) = tokens.next() {
+        match tok.as_str() {
+            "{" => current = Some(BTreeMap::new()),
+            "}" => {
+                if let Some(map) = current.take() {
+                    out.push(map);
+                }
+            }
+            key => {
+                if let Some(map) = current.as_mut()
+                    && let Some(value) = tokens.next()
+                {
+                    map.insert(key.to_string(), value);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// The BSP's entity lump (lump 0), parsed. The RBSP header is an 8-byte
+/// magic plus a 4-byte version, then 17 lump descriptors of
+/// `(offset: i32 LE, length: i32 LE)`. Empty when the file is truncated
+/// or lump 0 has zero length - maps without an entity lump fall through
+/// to `entry: None` and the flying framing camera.
+fn parse_entities_from_bsp(bytes: &[u8]) -> Vec<BTreeMap<String, String>> {
+    const HEADER: usize = 8 + 4;
+    let Some(raw) = bytes.get(..HEADER + 8) else {
+        return Vec::new();
+    };
+    let offset = i32::from_le_bytes([
+        raw[HEADER],
+        raw[HEADER + 1],
+        raw[HEADER + 2],
+        raw[HEADER + 3],
+    ]);
+    let length = i32::from_le_bytes([
+        raw[HEADER + 4],
+        raw[HEADER + 5],
+        raw[HEADER + 6],
+        raw[HEADER + 7],
+    ]);
+    if offset < 0 || length <= 0 {
+        return Vec::new();
+    }
+    let start = offset as usize;
+    let Some(slice) = start
+        .checked_add(length as usize)
+        .and_then(|end| bytes.get(start..end))
+    else {
+        return Vec::new();
+    };
+    parse_entities(slice)
+}
+
 /// Statistics collected while converting a BSP.
 #[derive(Debug, Default)]
 struct BspStats {
@@ -51,22 +142,24 @@ struct BspStats {
 
 /// Convert a Jedi Academy RBSP file into a static model and its lightmaps.
 pub fn model(bytes: &[u8], name: &str) -> Result<(ModelIr, BTreeMap<String, TextureIr>), BspError> {
-    let (ir, textures, _, _, _) = model_impl(bytes, name)?;
+    let (ir, textures, _, _, _, _) = model_impl(bytes, name)?;
     Ok((ir, textures))
 }
 
 /// Convert a BSP into a model plus visibility data and mesh-to-surface mapping.
 pub fn model_full(bytes: &[u8], name: &str) -> Result<(ModelIr, BspVis), BspError> {
-    let (ir, textures, _, mesh_surface, mesh_shaders) = model_impl(bytes, name)?;
+    let (ir, textures, _, mesh_surface, mesh_fog, _mesh_shaders) = model_impl(bytes, name)?;
     let visibility = JaVisibility::parse(bytes)?;
+    let entities = parse_entities_from_bsp(bytes);
 
     Ok((
         ir,
         BspVis {
             visibility,
             mesh_surface,
-            mesh_shaders,
+            mesh_fog,
             lightmaps: textures,
+            entities,
         },
     ))
 }
@@ -77,7 +170,7 @@ fn model_with_stats(
     bytes: &[u8],
     name: &str,
 ) -> Result<(ModelIr, BTreeMap<String, TextureIr>, BspStats), BspError> {
-    let (ir, textures, stats, _, _) = model_impl(bytes, name)?;
+    let (ir, textures, stats, _, _, _) = model_impl(bytes, name)?;
     Ok((ir, textures, stats))
 }
 
@@ -91,11 +184,13 @@ fn model_impl(
         BTreeMap<String, TextureIr>,
         BspStats,
         Vec<usize>,
+        Vec<i32>,
         Vec<bsp::BspShader>,
     ),
     BspError,
 > {
     let parsed = bsp::parse(bytes)?;
+    bsp::validate_references(bytes, &parsed)?;
 
     let shaders = bsp::parse_shaders(bytes, &parsed)?;
     let draw_verts = bsp::parse_draw_verts(bytes, &parsed)?;
@@ -106,6 +201,7 @@ fn model_impl(
     let mut textures = BTreeMap::new();
     let mut meshes = Vec::new();
     let mut mesh_surface = Vec::new();
+    let mut mesh_fog = Vec::new();
     let mut mesh_shaders = Vec::new();
     let mut stats = BspStats::default();
 
@@ -278,6 +374,7 @@ fn model_impl(
         };
 
         mesh_surface.push(surface_index);
+        mesh_fog.push(surface.fog);
         mesh_shaders.push(shader.clone());
 
         meshes.push(MeshIr {
@@ -295,6 +392,18 @@ fn model_impl(
                 .map(|vertex| vertex.tex_coords)
                 .collect(),
             uv2,
+            colours: mesh_vertices
+                .iter()
+                .map(|vertex| {
+                    let [r, g, b, a] = vertex.color[0];
+                    [
+                        f32::from(r) / 255.0,
+                        f32::from(g) / 255.0,
+                        f32::from(b) / 255.0,
+                        f32::from(a) / 255.0,
+                    ]
+                })
+                .collect(),
             indices: mesh_indexes,
             texture: (!texture.is_empty()).then_some(texture),
             lightmap,
@@ -331,7 +440,7 @@ fn model_impl(
         folded: Vec::new(),
     };
 
-    Ok((ir, textures, stats, mesh_surface, mesh_shaders))
+    Ok((ir, textures, stats, mesh_surface, mesh_fog, mesh_shaders))
 }
 
 fn tessellate_patch(
@@ -494,18 +603,35 @@ fn normalize(vector: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// Expand one embedded BSP RGB lightmap into the runtime's RGBA8 texture.
+/// Upscale one embedded BSP RGB lightmap 8x into an RGBA8 texture.
 fn lightmap_texture(rgb: &[u8]) -> TextureIr {
-    let mut rgba = Vec::with_capacity(LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4);
+    const SCALE: u32 = 8;
 
-    for pixel in rgb.chunks_exact(LIGHTMAP_CHANNELS) {
+    let source =
+        image::RgbImage::from_raw(LIGHTMAP_WIDTH as u32, LIGHTMAP_HEIGHT as u32, rgb.to_vec())
+            .expect("Jedi Academy BSP lightmap has an invalid RGB buffer");
+
+    let width = LIGHTMAP_WIDTH as u32 * SCALE;
+    let height = LIGHTMAP_HEIGHT as u32 * SCALE;
+
+    let resized = image::imageops::resize(
+        &source,
+        width,
+        height,
+        image::imageops::FilterType::Triangle,
+    );
+
+    let resized_rgb = resized.into_raw();
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+
+    for pixel in resized_rgb.chunks_exact(LIGHTMAP_CHANNELS) {
         rgba.extend_from_slice(pixel);
         rgba.push(255);
     }
 
     TextureIr {
-        width: LIGHTMAP_WIDTH as u32,
-        height: LIGHTMAP_HEIGHT as u32,
+        width,
+        height,
         encoding: Encoding::Rgba8,
         mips: vec![rgba],
         cube: false,
@@ -657,6 +783,168 @@ mod tests {
 
             let draw_verts =
                 fmt_ja::bsp::parse_draw_verts(&bytes, &parsed).expect("reading draw vertices");
+
+            let draw_indexes =
+                fmt_ja::bsp::parse_draw_indexes(&bytes, &parsed).expect("reading draw indexes");
+
+            println!("\n=== GEOMETRY DIAGNOSTICS ===");
+
+            let mut total_triangles = 0usize;
+            let mut repeated_triangles = 0usize;
+            let mut zero_area_triangles = 0usize;
+            let mut malformed_surfaces = 0usize;
+
+            for (surface_index, surface) in surfaces.iter().enumerate() {
+                if !matches!(surface.surface_type, 1 | 3) {
+                    continue;
+                }
+
+                let first = usize::try_from(surface.first_index).ok();
+                let count = usize::try_from(surface.num_indexes).ok();
+
+                let index_slice = first.zip(count).and_then(|(first, count)| {
+                    first
+                        .checked_add(count)
+                        .and_then(|end| draw_indexes.get(first..end))
+                });
+
+                let Some(index_slice) = index_slice else {
+                    println!("Surface {surface_index}: invalid index range");
+                    malformed_surfaces += 1;
+                    continue;
+                };
+
+                if index_slice.len() % 3 != 0 {
+                    println!(
+                        "Surface {surface_index}: index count {} is not divisible by 3",
+                        index_slice.len()
+                    );
+                    malformed_surfaces += 1;
+                    continue;
+                }
+
+                let mut surface_repeated = 0usize;
+                let mut surface_zero_area = 0usize;
+
+                for triangle in index_slice.chunks_exact(3) {
+                    let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
+                    total_triangles += 1;
+
+                    if a < 0 || b < 0 || c < 0 || a == b || b == c || a == c {
+                        repeated_triangles += 1;
+                        surface_repeated += 1;
+                        continue;
+                    }
+
+                    let base = match usize::try_from(surface.first_vert) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            malformed_surfaces += 1;
+                            continue;
+                        }
+                    };
+
+                    let positions = [a, b, c]
+                        .map(|index| {
+                            usize::try_from(index)
+                                .ok()
+                                .and_then(|index| base.checked_add(index))
+                        })
+                        .map(|index| index.and_then(|index| draw_verts.get(index)));
+
+                    let [Some(a), Some(b), Some(c)] = positions else {
+                        malformed_surfaces += 1;
+                        continue;
+                    };
+
+                    let ab = [
+                        b.position[0] - a.position[0],
+                        b.position[1] - a.position[1],
+                        b.position[2] - a.position[2],
+                    ];
+
+                    let ac = [
+                        c.position[0] - a.position[0],
+                        c.position[1] - a.position[1],
+                        c.position[2] - a.position[2],
+                    ];
+
+                    let cross = [
+                        ab[1] * ac[2] - ab[2] * ac[1],
+                        ab[2] * ac[0] - ab[0] * ac[2],
+                        ab[0] * ac[1] - ab[1] * ac[0],
+                    ];
+
+                    let area_squared =
+                        cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
+
+                    if !area_squared.is_finite() || area_squared <= 1.0e-12 {
+                        zero_area_triangles += 1;
+                        surface_zero_area += 1;
+                    }
+                }
+
+                if surface_repeated > 0 || surface_zero_area > 0 {
+                    println!(
+                        "Surface {surface_index}: type={}, repeated={}, zero-area={}",
+                        surface.surface_type, surface_repeated, surface_zero_area
+                    );
+                }
+            }
+
+            println!("Triangles examined: {total_triangles}");
+            println!("Repeated-index triangles: {repeated_triangles}");
+            println!("Zero-area triangles: {zero_area_triangles}");
+            println!("Malformed surfaces: {malformed_surfaces}");
+
+            println!("\n=== FOG / BRUSH DIAGNOSTICS ===");
+
+            let fogs = fmt_ja::bsp::parse_fogs(&bytes, &parsed).expect("reading fog records");
+            let brushes = fmt_ja::bsp::parse_brushes(&bytes, &parsed).expect("reading brushes");
+            let brush_sides =
+                fmt_ja::bsp::parse_brush_sides(&bytes, &parsed).expect("reading brush sides");
+            let planes = fmt_ja::bsp::parse_planes(&bytes, &parsed).expect("reading planes");
+
+            println!("Fog records: {}", fogs.len());
+            println!("Brushes: {}", brushes.len());
+            println!("Brush sides: {}", brush_sides.len());
+            println!("Planes: {}", planes.len());
+
+            for (index, fog) in fogs.iter().enumerate() {
+                println!(
+                    "Fog {index}: shader={}, brush={}, visible_side={}",
+                    fog.shader, fog.brush, fog.visible_side
+                );
+
+                if let Ok(brush_index) = usize::try_from(fog.brush) {
+                    if let Some(brush) = brushes.get(brush_index) {
+                        println!(
+                            "  Brush: shader={}, sides={}",
+                            brush.shader, brush.num_sides
+                        );
+                    } else {
+                        println!("  WARNING: fog references missing brush");
+                    }
+                } else {
+                    println!("  No brush index (possible global fog)");
+                }
+            }
+
+            println!("\nBrush content flags:");
+
+            for (index, brush) in brushes.iter().enumerate() {
+                if let Ok(shader_index) = usize::try_from(brush.shader) {
+                    if let Some(shader) = shaders.get(shader_index) {
+                        if shader.content_flags != 0 {
+                            println!(
+                                "Brush {index}: {} contents={:#010x}, sides={}",
+                                shader.name, shader.content_flags, brush.num_sides
+                            );
+                        }
+                    }
+                }
+            }
+
             let lightmaps =
                 fmt_ja::bsp::parse_lightmaps(&bytes, &parsed).expect("reading lightmaps");
 
@@ -708,7 +996,40 @@ mod tests {
             for (slot, count) in lightmap_slot_counts.iter().enumerate() {
                 println!("  Slot {slot}: {count} surfaces");
             }
+            println!();
+            println!("Lightmap UV ranges by atlas:");
 
+            for atlas in 0..lightmaps.len() {
+                let mut min_u = f32::INFINITY;
+                let mut min_v = f32::INFINITY;
+                let mut max_u = f32::NEG_INFINITY;
+                let mut max_v = f32::NEG_INFINITY;
+                let mut vertex_count = 0usize;
+
+                for surface in &surfaces {
+                    if surface.lightmap_num[0] != atlas as i32 {
+                        continue;
+                    }
+
+                    let start = surface.first_vert as usize;
+                    let end = start + surface.num_verts as usize;
+
+                    for vertex in &draw_verts[start..end] {
+                        let [u, v] = vertex.lightmap_coords[0];
+                        min_u = min_u.min(u);
+                        min_v = min_v.min(v);
+                        max_u = max_u.max(u);
+                        max_v = max_v.max(v);
+                        vertex_count += 1;
+                    }
+                }
+
+                if vertex_count > 0 {
+                    println!(
+                        "  Atlas {atlas}: {vertex_count} vertices, U={min_u:.4}..{max_u:.4}, V={min_v:.4}..{max_v:.4}"
+                    );
+                }
+            }
             let planar = surfaces.iter().filter(|s| s.surface_type == 1).count();
             let patches = surfaces.iter().filter(|s| s.surface_type == 2).count();
             let triangle_soup = surfaces.iter().filter(|s| s.surface_type == 3).count();
@@ -785,7 +1106,62 @@ mod tests {
             println!("  Lightmapped meshes: {}", lightmapped.len());
             println!("  UV2 coordinates: {uv2_count}");
             println!("  Out-of-range UV2 coordinates: {uv2_out_of_range}");
+            let mut rgb_sum: u64 = 0;
+            let mut rgb_count: u64 = 0;
+            let mut rgb_min = u8::MAX;
+            let mut rgb_max = u8::MIN;
+            let mut dark_pixels: u64 = 0;
+            let mut pixel_count: u64 = 0;
 
+            for (name, texture) in lightmaps
+                .iter()
+                .filter(|(name, _)| name.contains("_lightmap_"))
+            {
+                let Some(rgba) = texture.mips.first() else {
+                    continue;
+                };
+
+                for pixel in rgba.chunks_exact(4) {
+                    let brightness =
+                        u16::from(pixel[0]) + u16::from(pixel[1]) + u16::from(pixel[2]);
+
+                    for channel in &pixel[..3] {
+                        rgb_sum += u64::from(*channel);
+                        rgb_count += 1;
+                        rgb_min = rgb_min.min(*channel);
+                        rgb_max = rgb_max.max(*channel);
+                    }
+
+                    pixel_count += 1;
+
+                    if brightness < 24 {
+                        dark_pixels += 1;
+                    }
+                }
+
+                let _ = name;
+            }
+
+            println!();
+            println!("Lightmap pixel diagnostics:");
+            println!(
+                "  Lightmap textures: {}",
+                lightmaps
+                    .keys()
+                    .filter(|name| name.contains("_lightmap_"))
+                    .count()
+            );
+            println!("  Pixels: {pixel_count}");
+            println!("  RGB minimum: {rgb_min}");
+            println!("  RGB maximum: {rgb_max}");
+            println!(
+                "  RGB average: {:.2}",
+                rgb_sum as f64 / rgb_count.max(1) as f64
+            );
+            println!(
+                "  Nearly black pixels: {:.2}%",
+                dark_pixels as f64 * 100.0 / pixel_count.max(1) as f64
+            );
             let mesh_count = model.meshes.len();
             let vertex_count: usize = model.meshes.iter().map(|mesh| mesh.positions.len()).sum();
             let index_count: usize = model.meshes.iter().map(|mesh| mesh.indices.len()).sum();

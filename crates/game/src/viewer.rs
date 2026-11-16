@@ -216,6 +216,13 @@ pub struct LoadedScene {
     pub models: Vec<Placed>,
     pub textures: BTreeMap<String, TextureIr>,
     pub ja_shaders: BTreeMap<String, fmt_ja::shader::Shader>,
+    pub ja_shader_ir: BTreeMap<String, crate::ja_shader::JaShader>,
+    /// The BSP shader's six-face skybox, when its skyParms resolve.
+    pub skybox: Option<TextureIr>,
+    /// Jedi Academy BSP fog records, independent of Odyssey area fog.
+    pub ja_fogs: Vec<JaFog>,
+    /// Whether this scene uses Jedi Academy BSP rendering and PVS rules.
+    pub is_ja: bool,
     /// Texture names the meshes use but the install does not resolve, or
     /// that do not decode (`stand_in` says what is drawn instead).
     pub missing: Vec<String>,
@@ -284,6 +291,10 @@ pub struct LoadedScene {
     /// A module's sound, read with it for the world's first frame
     /// (`ambience`); `None` where nothing plays it.
     pub sound: Option<crate::ambience::Preread>,
+    /// The BSP map's collision, when the scene has one (a `kjk view ja
+    /// <bsp>` or a `kjk play ja <bsp>`); the sim's `Level` when the scene
+    /// is a KOTOR module.
+    pub collision: Option<Arc<collision::Level>>,
     /// The area's `DefaultEnvMap`: the env map of a body whose appearance
     /// asks for the area's (`creature::EnvMap::AreaDefault`).
     pub default_envmap: Option<String>,
@@ -391,6 +402,19 @@ impl SceneGrass {
                 .filter_map(|patch| patch.lightmap.as_ref()),
         )
     }
+}
+
+/// A Jedi Academy BSP fog record and its resolved shader/volume data.
+#[derive(Debug, Clone, Default)]
+pub struct JaFog {
+    pub shader: String,
+    pub brush: i32,
+    pub visible_side: i32,
+    pub color: Option<[f32; 3]>,
+    pub distance: Option<f32>,
+    /// Convex volume boundary planes as (normal, distance).
+    /// Empty for global fog records or unresolved brush geometry.
+    pub planes: Vec<([f32; 3], f32)>,
 }
 
 impl LoadedScene {
@@ -1071,9 +1095,11 @@ pub fn load_model(
     }];
     let (textures, missing) = textures(&resolver, &models);
     Ok(LoadedScene {
+        collision: None,
         name: name.to_string(),
         models,
         textures,
+        ja_shader_ir: BTreeMap::new(),
         missing,
         missing_body_textures: Vec::new(),
         default_envmap: None,
@@ -1371,9 +1397,14 @@ pub fn module_scene(
     missing.extend(creatures.missing_body_textures.iter().cloned());
     Ok(LoadedScene {
         probes: Arc::new(probes),
+        collision: None,
+        is_ja: false,
         default_envmap: creatures.default_envmap,
         missing_body_textures: creatures.missing_body_textures,
         ja_shaders: BTreeMap::new(),
+        ja_shader_ir: BTreeMap::new(),
+        skybox: None,
+        ja_fogs: Vec::new(),
         instances,
         creatures: creatures.placed,
         creature_refusals: creatures.refusals,

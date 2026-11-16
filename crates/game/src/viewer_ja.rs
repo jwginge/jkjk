@@ -370,7 +370,8 @@ fn shader_definitions<'f>(files: &'f Files) -> &'f BTreeMap<String, fmt_ja::shad
             };
 
             for shader in parsed.shaders {
-                out.entry(shader.name.clone()).or_insert(shader);
+                out.entry(shader.name.to_ascii_lowercase())
+                    .or_insert(shader);
             }
         }
 
@@ -728,7 +729,75 @@ fn load_bsp(files: &Files<'_>, path: &str) -> Result<LoadedScene, String> {
     let (ir, bsp) =
         asset_ja::bsp::model_full(&bytes, &path).map_err(|error| format!("{path}: {error:?}"))?;
 
+    let collision = collision_odyssey::ja::build_bsp(&bytes).ok().map(Arc::new);
+    eprintln!(
+        "JA BSP COLLISION: {} brushes",
+        collision.as_ref().map_or(0, |l| l.brush_count()),
+    );
+
     let parsed_bsp = fmt_ja::bsp::parse(&bytes).map_err(|error| format!("{path}: {error:?}"))?;
+    let bsp_surfaces = fmt_ja::bsp::parse_surfaces(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+    let bsp_shaders = fmt_ja::bsp::parse_shaders(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+    let bsp_fogs = fmt_ja::bsp::parse_fogs(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+    let bsp_brushes = fmt_ja::bsp::parse_brushes(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+    let bsp_brush_sides = fmt_ja::bsp::parse_brush_sides(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+    let bsp_planes = fmt_ja::bsp::parse_planes(&bytes, &parsed_bsp)
+        .map_err(|error| format!("{path}: {error:?}"))?;
+
+    eprintln!("\n=== SKY SURFACE TRACE ===");
+
+    let sky_shader_indices: std::collections::BTreeSet<usize> = bsp_shaders
+        .iter()
+        .enumerate()
+        .map(|(index, shader)| {
+            eprintln!(
+                "BSP SHADER [{index}]: {} surface={:#010x} content={:#010x}",
+                shader.name, shader.surface_flags, shader.content_flags,
+            );
+            index
+        })
+        .filter(|index| {
+            bsp_shaders[*index]
+                .name
+                .to_ascii_lowercase()
+                .contains("skies/")
+        })
+        .collect();
+
+    for (surface_index, surface) in bsp_surfaces.iter().enumerate() {
+        let shader_index = match usize::try_from(surface.shader) {
+            Ok(index) if sky_shader_indices.contains(&index) => index,
+            _ => continue,
+        };
+
+        let mesh_indices: Vec<usize> = bsp
+            .mesh_surface
+            .iter()
+            .enumerate()
+            .filter_map(|(mesh_index, &source_surface)| {
+                (source_surface == surface_index).then_some(mesh_index)
+            })
+            .collect();
+
+        eprintln!(
+            "SKY SURFACE [{surface_index}]: shader={shader_index} {:?}, type={}, verts={}+{}, indexes={}+{}, meshes={:?}, clusters={:?}",
+            bsp_shaders[shader_index].name,
+            surface.surface_type,
+            surface.first_vert,
+            surface.num_verts,
+            surface.first_index,
+            surface.num_indexes,
+            mesh_indices,
+            bsp.visibility.surface_clusters(surface_index),
+        );
+    }
+
+    eprintln!("=== END SKY SURFACE TRACE ===\n");
 
     let entities = fmt_ja::bsp::parse_entities(&bytes, &parsed_bsp)
         .map_err(|error| format!("{path}: {error:?}"))?;
@@ -877,29 +946,137 @@ fn load_bsp(files: &Files<'_>, path: &str) -> Result<LoadedScene, String> {
     }];
 
     let mut names = scene_textures(&models, &[]);
+    names.extend(bsp_fogs.iter().map(|fog| fog.shader.clone()));
 
     let definitions = shader_definitions(files);
     let ja_shaders: BTreeMap<String, fmt_ja::shader::Shader> = names
         .iter()
         .filter_map(|name| {
             definitions
-                .get(name)
+                .get(&name.to_ascii_lowercase())
                 .map(|shader| (name.clone(), shader.clone()))
         })
         .collect();
+    let ja_shader_ir: BTreeMap<String, crate::ja_shader::JaShader> = ja_shaders
+        .iter()
+        .map(|(name, shader)| (name.clone(), crate::ja_shader::interpret(shader.clone())))
+        .collect();
 
-    // Load ordinary image maps referenced by every shader stage.
-    for shader in ja_shaders.values() {
+    let ja_fogs: Vec<crate::viewer::JaFog> = bsp_fogs
+        .iter()
+        .map(|fog| {
+            let fog_params = ja_shader_ir.get(&fog.shader).and_then(|shader| {
+                shader
+                    .directives
+                    .iter()
+                    .find_map(|directive| match &directive.kind {
+                        crate::ja_shader::ShaderDirectiveKind::FogParms(args) => {
+                            let values: Vec<f32> = args
+                                .iter()
+                                .filter_map(|arg| arg.parse::<f32>().ok())
+                                .collect();
+
+                            if values.len() >= 4 {
+                                Some(([values[0], values[1], values[2]], values[3]))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })
+            });
+
+            let planes = usize::try_from(fog.brush)
+                .ok()
+                .and_then(|brush_index| bsp_brushes.get(brush_index))
+                .and_then(|brush| {
+                    let start = usize::try_from(brush.first_side).ok()?;
+                    let count = usize::try_from(brush.num_sides).ok()?;
+                    let end = start.checked_add(count)?;
+                    bsp_brush_sides.get(start..end)
+                })
+                .map(|sides| {
+                    sides
+                        .iter()
+                        .filter_map(|side| {
+                            let plane_index = usize::try_from(side.plane).ok()?;
+                            let plane = bsp_planes.get(plane_index)?;
+                            Some((plane.normal, plane.dist))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            crate::viewer::JaFog {
+                shader: fog.shader.clone(),
+                brush: fog.brush,
+                visible_side: fog.visible_side,
+                color: fog_params.map(|params| params.0),
+                distance: fog_params.map(|params| params.1),
+                planes,
+            }
+        })
+        .collect();
+
+    for (index, fog) in ja_fogs.iter().enumerate() {
+        eprintln!(
+            "JA BSP FOG [{index}]: shader={}, brush={}, visible_side={}, \
+             color={:?}, distance={:?}, planes={}",
+            fog.shader,
+            fog.brush,
+            fog.visible_side,
+            fog.color,
+            fog.distance,
+            fog.planes.len(),
+        );
+    }
+    let mut surface_fog_counts = BTreeMap::<i32, usize>::new();
+    for surface in &bsp_surfaces {
+        *surface_fog_counts.entry(surface.fog).or_default() += 1;
+    }
+
+    eprintln!(
+        "JA BSP SURFACE FOG INDICES: surfaces={}, records={}, raw={:?}",
+        bsp_surfaces.len(),
+        ja_fogs.len(),
+        surface_fog_counts,
+    );
+    // TEMPORARY: inspect sky-related assets and original shader definitions.
+    eprintln!("\n=== SKY-RELATED ARCHIVE ENTRIES ===");
+    for name in files.all.keys() {
+        if name.contains("sky") || name.contains("hoth") || name.contains("taspir") {
+            eprintln!("  {name}");
+        }
+    }
+
+    eprintln!("\n=== ORIGINAL HOTH AND VJUN SKY DEFINITIONS ===");
+    for shader_name in ["textures/skies/hoth", "textures/skies/taspir1"] {
+        match definitions.get(&shader_name.to_ascii_lowercase()) {
+            Some(shader) => eprintln!("{shader_name}:\n{shader:#?}"),
+            None => eprintln!("{shader_name}: NOT FOUND IN ARCHIVES"),
+        }
+    }
+    // Load every ordinary image referenced by interpreted JA shader stages.
+    for shader in ja_shader_ir.values() {
         for stage in &shader.stages {
-            for directive in stage {
-                if directive.first().is_some_and(|word| {
-                    word.eq_ignore_ascii_case("map") || word.eq_ignore_ascii_case("clampmap")
-                }) {
-                    if let Some(name) = directive.get(1)
-                        && !name.starts_with('$')
-                        && !names.contains(name)
-                    {
-                        names.push(name.clone());
+            for directive in &stage.directives {
+                if let crate::ja_shader::StageDirectiveKind::Map(map) = &directive.kind {
+                    let names_to_load: Vec<&str> = match map {
+                        crate::ja_shader::TextureMap::Map(name)
+                        | crate::ja_shader::TextureMap::ClampMap(name) => vec![name.as_str()],
+                        crate::ja_shader::TextureMap::AnimMap { frames, .. }
+                        | crate::ja_shader::TextureMap::ClampAnimMap { frames, .. }
+                        | crate::ja_shader::TextureMap::OneShotAnimMap { frames, .. } => {
+                            frames.iter().map(String::as_str).collect()
+                        }
+                        crate::ja_shader::TextureMap::VideoMap(_) => Vec::new(),
+                    };
+
+                    for name in names_to_load {
+                        if !name.starts_with('$') && !names.iter().any(|existing| existing == name)
+                        {
+                            names.push(name.to_owned());
+                        }
                     }
                 }
             }
@@ -907,6 +1084,124 @@ fn load_bsp(files: &Files<'_>, path: &str) -> Result<LoadedScene, String> {
     }
 
     let (mut textures, missing) = textures(files, &names);
+
+    // Resolve the cubemap named by a BSP shader marked surfaceparm sky.
+    // Quake 3 face suffixes are uploaded in wgpu cube-layer order:
+    // +X, -X, +Y, -Y, +Z, -Z.
+    let skybox = ja_shader_ir.iter().find_map(|(shader_name, shader)| {
+        let is_sky = shader.directives.iter().any(|directive| {
+            matches!(
+                &directive.kind,
+                crate::ja_shader::ShaderDirectiveKind::SurfaceParm(value)
+                    if value.eq_ignore_ascii_case("sky")
+            )
+        });
+
+        if !is_sky {
+            return None;
+        }
+
+        let prefix = shader
+            .directives
+            .iter()
+            .find_map(|directive| match &directive.kind {
+                crate::ja_shader::ShaderDirectiveKind::SkyParms(args) => {
+                    args.first().map(String::as_str)
+                }
+                _ => None,
+            })?;
+
+        eprintln!(
+            "BSP SKY CANDIDATE: {shader_name}, prefix={prefix}, stages={}",
+            shader.stages.len()
+        );
+
+        if prefix == "-" {
+            return None;
+        }
+
+        // Bevy/wgpu cube-layer order: +X, -X, +Y, -Y, +Z, -Z.
+        let suffixes = ["rt", "lf", "up", "dn", "ft", "bk"];
+
+        // Load each face independently so missing faces do not invalidate the cube.
+        let loaded: Vec<Option<TextureIr>> = suffixes
+            .iter()
+            .map(|suffix| texture(files, &format!("{prefix}_{suffix}")))
+            .collect();
+
+        eprintln!(
+            "BSP SKY FACES: {shader_name}: {}",
+            suffixes
+                .iter()
+                .zip(loaded.iter())
+                .map(|(suffix, face)| format!("{suffix}={}", face.is_some()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let (width, height) = loaded
+            .iter()
+            .flatten()
+            .next()
+            .map(|face| (face.width, face.height))
+            .unwrap_or((1, 1));
+
+        if width != height {
+            eprintln!("BSP skybox {prefix}: faces must be square");
+            return None;
+        }
+
+        if loaded
+            .iter()
+            .flatten()
+            .any(|face| face.width != width || face.height != height)
+        {
+            eprintln!("BSP skybox {prefix}: faces have inconsistent dimensions");
+            return None;
+        }
+
+        let missing_faces: Vec<&str> = loaded
+            .iter()
+            .zip(suffixes.iter())
+            .filter_map(|(face, suffix)| face.is_none().then_some(*suffix))
+            .collect();
+
+        // Neutral white fallback for any missing face.
+        let fallback = vec![255u8; width as usize * height as usize * 4];
+
+        let faces: Vec<Vec<Vec<u8>>> = loaded
+            .into_iter()
+            .map(|face| match face {
+                Some(face) => face.mips,
+                None => vec![fallback.clone()],
+            })
+            .collect();
+
+        if !missing_faces.is_empty() {
+            eprintln!(
+                "BSP skybox {prefix}: using fallback for missing faces: {}",
+                missing_faces.join(", ")
+            );
+        }
+
+        Some(TextureIr {
+            width,
+            height,
+            encoding: Encoding::Rgba8,
+            mips: faces[0].clone(),
+            cube: true,
+            frames: 1,
+            facts: TextureFacts::default(),
+            faces,
+            frame_mips: Vec::new(),
+        })
+    });
+
+    if skybox.is_some() {
+        eprintln!("BSP skybox: loaded six cubemap faces");
+    } else {
+        eprintln!("BSP skybox: no usable skyParms cubemap");
+    }
 
     eprintln!(
         "BSP: resolved {} textures, {} missing",
@@ -922,12 +1217,21 @@ fn load_bsp(files: &Files<'_>, path: &str) -> Result<LoadedScene, String> {
         );
     }
 
+    eprintln!("JA BSP SHADERS: {}", ja_shaders.len());
+
     for (name, shader) in &ja_shaders {
-        if ["spot", "light", "lamp", "glow"]
-            .iter()
-            .any(|word| name.contains(word))
-        {
-            eprintln!("JA BSP SHADER: {name}\n{shader:#?}");
+        eprintln!("\nJA BSP SHADER: {name}");
+
+        for directive in &shader.directives {
+            eprintln!("  SHADER: {}", directive.join(" "));
+        }
+
+        for (index, stage) in shader.stages.iter().enumerate() {
+            eprintln!("  STAGE {index}:");
+
+            for directive in stage {
+                eprintln!("    {}", directive.join(" "));
+            }
         }
     }
 
@@ -940,9 +1244,14 @@ fn load_bsp(files: &Files<'_>, path: &str) -> Result<LoadedScene, String> {
         textures,
         missing,
         ja_shaders,
+        ja_shader_ir,
+        skybox,
+        ja_fogs,
+        is_ja: true,
         ambient: [1.0; 3],
         lit: true,
         entry,
+        collision,
         ..LoadedScene::default()
     })
 }
@@ -1030,6 +1339,7 @@ pub fn load(
         name: path,
         models,
         textures,
+        ja_shader_ir: BTreeMap::new(),
         missing,
         missing_body_textures: Vec::new(),
         default_envmap: None,
@@ -1044,7 +1354,7 @@ pub fn load(
         missing_clips: Vec::new(),
         creature_notes: notes,
         weapons: 0,
-        ambient: [0.2; 3],
+        ambient: [1.0; 3],
         fog: None,
         cameras: Vec::new(),
         map: None,

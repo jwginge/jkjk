@@ -777,6 +777,83 @@ fn checked_range(
 }
 
 /// Validate node references to planes.
+/// Validate brush shader references and brush-side ranges.
+pub fn validate_brushes(
+    brushes: &[BspBrush],
+    brush_sides: &[BspBrushSide],
+    shaders: &[BspShader],
+) -> Result<(), BspError> {
+    for (index, brush) in brushes.iter().enumerate() {
+        validate_reference(brush.shader, shaders.len(), "brush", "shader", index)?;
+
+        checked_range(
+            brush.first_side,
+            brush.num_sides,
+            brush_sides.len(),
+            "brush side",
+            index,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Validate model references to surfaces and brushes.
+pub fn validate_models(
+    models: &[BspModel],
+    surfaces: &[BspSurface],
+    brushes: &[BspBrush],
+) -> Result<(), BspError> {
+    for (index, model) in models.iter().enumerate() {
+        checked_range(
+            model.first_surface,
+            model.num_surfaces,
+            surfaces.len(),
+            "model surface",
+            index,
+        )?;
+
+        checked_range(
+            model.first_brush,
+            model.num_brushes,
+            brushes.len(),
+            "model brush",
+            index,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Parse the geometry-related lumps and validate their cross-lump references.
+///
+/// This deliberately leaves fog and lightmap sentinel conventions to their
+/// own validation once those format-specific rules have been established.
+pub fn validate_references(bytes: &[u8], bsp: &Bsp) -> Result<(), BspError> {
+    let shaders = parse_shaders(bytes, bsp)?;
+    let planes = parse_planes(bytes, bsp)?;
+    let nodes = parse_nodes(bytes, bsp)?;
+    let leaves = parse_leaves(bytes, bsp)?;
+    let leaf_surfaces = parse_leaf_surfaces(bytes, bsp)?;
+    let leaf_brushes = parse_leaf_brushes(bytes, bsp)?;
+    let models = parse_models(bytes, bsp)?;
+    let brushes = parse_brushes(bytes, bsp)?;
+    let brush_sides = parse_brush_sides(bytes, bsp)?;
+    let draw_verts = parse_draw_verts(bytes, bsp)?;
+    let draw_indexes = parse_draw_indexes(bytes, bsp)?;
+    let surfaces = parse_surfaces(bytes, bsp)?;
+
+    validate_nodes(&nodes, &planes)?;
+    validate_node_children(&nodes, &leaves)?;
+    validate_leaf_references(&leaves, &leaf_surfaces, &leaf_brushes)?;
+    validate_leaf_index_references(&leaf_surfaces, &leaf_brushes, &surfaces, &brushes)?;
+    validate_brushes(&brushes, &brush_sides, &shaders)?;
+    validate_brush_sides(&brush_sides, &planes, &shaders)?;
+    validate_models(&models, &surfaces, &brushes)?;
+    validate_surfaces(&surfaces, &shaders, &draw_verts, &draw_indexes)?;
+
+    Ok(())
+}
 pub fn validate_nodes(nodes: &[BspNode], planes: &[BspPlane]) -> Result<(), BspError> {
     for (i, node) in nodes.iter().enumerate() {
         validate_reference(node.plane, planes.len(), "node", "plane", i)?;
@@ -784,6 +861,89 @@ pub fn validate_nodes(nodes: &[BspNode], planes: &[BspPlane]) -> Result<(), BspE
     Ok(())
 }
 
+/// Validate the surface and brush index ranges stored by each leaf.
+pub fn validate_leaf_references(
+    leaves: &[BspLeaf],
+    leaf_surfaces: &[i32],
+    leaf_brushes: &[i32],
+) -> Result<(), BspError> {
+    for (index, leaf) in leaves.iter().enumerate() {
+        checked_range(
+            leaf.first_leaf_surface,
+            leaf.num_leaf_surfaces,
+            leaf_surfaces.len(),
+            "leaf surface",
+            index,
+        )?;
+
+        checked_range(
+            leaf.first_leaf_brush,
+            leaf.num_leaf_brushes,
+            leaf_brushes.len(),
+            "leaf brush",
+            index,
+        )?;
+    }
+
+    Ok(())
+}
+/// Validate the actual surface and brush indices stored in leaf index arrays.
+pub fn validate_leaf_index_references(
+    leaf_surfaces: &[i32],
+    leaf_brushes: &[i32],
+    surfaces: &[BspSurface],
+    brushes: &[BspBrush],
+) -> Result<(), BspError> {
+    for (index, &surface) in leaf_surfaces.iter().enumerate() {
+        validate_reference(
+            surface,
+            surfaces.len(),
+            "leaf-surface index",
+            "surface",
+            index,
+        )?;
+    }
+
+    for (index, &brush) in leaf_brushes.iter().enumerate() {
+        validate_reference(brush, brushes.len(), "leaf-brush index", "brush", index)?;
+    }
+
+    Ok(())
+}
+/// Validate node child references against the node and leaf collections.
+///
+/// Non-negative children reference nodes. Negative children encode leaves
+/// using the BSP convention: leaf_index = -(child + 1).
+pub fn validate_node_children(nodes: &[BspNode], leaves: &[BspLeaf]) -> Result<(), BspError> {
+    for (node_index, node) in nodes.iter().enumerate() {
+        for (side, &child) in node.children.iter().enumerate() {
+            if child >= 0 {
+                validate_reference(
+                    child,
+                    nodes.len(),
+                    "node child",
+                    "node",
+                    node_index * 2 + side,
+                )?;
+            } else {
+                // Widen before adding/negating so i32::MIN is handled safely.
+                let leaf_index = usize::try_from(-(i64::from(child) + 1)).map_err(|_| {
+                    BspError::Bad(format!(
+                        "node {node_index} child {side} has invalid leaf reference {child}"
+                    ))
+                })?;
+
+                if leaf_index >= leaves.len() {
+                    return Err(BspError::Bad(format!(
+                        "node {node_index} child {side} references invalid leaf {leaf_index}"
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
 /// Validate brush-side references to planes and shaders.
 pub fn validate_brush_sides(
     sides: &[BspBrushSide],
@@ -899,6 +1059,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validates_brush_references() {
+        let brushes = [BspBrush {
+            first_side: 0,
+            num_sides: 1,
+            shader: 0,
+        }];
+        let sides = [BspBrushSide {
+            plane: 0,
+            shader: 0,
+            draw_surface: -1,
+        }];
+
+        assert!(validate_brushes(&brushes, &sides, &[test_shader()]).is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_brush_side_range() {
+        let brushes = [BspBrush {
+            first_side: 1,
+            num_sides: 1,
+            shader: 0,
+        }];
+
+        assert!(matches!(
+            validate_brushes(&brushes, &[], &[test_shader()]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_brush_shader() {
+        let brushes = [BspBrush {
+            first_side: 0,
+            num_sides: 0,
+            shader: 1,
+        }];
+
+        assert!(matches!(
+            validate_brushes(&brushes, &[], &[test_shader()]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_model_surface_range() {
+        let models = [BspModel {
+            mins: [0.0; 3],
+            maxs: [0.0; 3],
+            first_surface: 1,
+            num_surfaces: 1,
+            first_brush: 0,
+            num_brushes: 0,
+        }];
+
+        assert!(matches!(
+            validate_models(&models, &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_model_brush_range() {
+        let models = [BspModel {
+            mins: [0.0; 3],
+            maxs: [0.0; 3],
+            first_surface: 0,
+            num_surfaces: 0,
+            first_brush: 0,
+            num_brushes: 1,
+        }];
+
+        assert!(matches!(
+            validate_models(&models, &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn validates_empty_bsp_cross_lump_references() {
+        let bytes = empty_header();
+        let bsp = parse(&bytes).unwrap();
+
+        assert!(validate_references(&bytes, &bsp).is_ok());
+    }
     #[test]
     fn parses_valid_empty_header() {
         let bsp = parse(&empty_header()).unwrap();
@@ -1470,6 +1715,224 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn validates_leaf_index_references() {
+        let surfaces = [test_surface()];
+        let brushes = [BspBrush {
+            first_side: 0,
+            num_sides: 0,
+            shader: 0,
+        }];
+
+        assert!(validate_leaf_index_references(&[0], &[0], &surfaces, &brushes).is_ok());
+    }
+
+    #[test]
+    fn rejects_negative_leaf_surface_index() {
+        assert!(matches!(
+            validate_leaf_index_references(&[-1], &[], &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_leaf_surface_index() {
+        assert!(matches!(
+            validate_leaf_index_references(&[0], &[], &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_negative_leaf_brush_index() {
+        assert!(matches!(
+            validate_leaf_index_references(&[], &[-1], &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_out_of_range_leaf_brush_index() {
+        assert!(matches!(
+            validate_leaf_index_references(&[], &[0], &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+    #[test]
+    fn validates_leaf_surface_and_brush_ranges() {
+        let leaves = [BspLeaf {
+            cluster: 0,
+            area: 0,
+            mins: [0; 3],
+            maxs: [0; 3],
+            first_leaf_surface: 1,
+            num_leaf_surfaces: 2,
+            first_leaf_brush: 0,
+            num_leaf_brushes: 1,
+        }];
+
+        assert!(validate_leaf_references(&leaves, &[0, 1, 2], &[0]).is_ok());
+    }
+
+    #[test]
+    fn rejects_leaf_surface_range_out_of_bounds() {
+        let leaves = [BspLeaf {
+            cluster: 0,
+            area: 0,
+            mins: [0; 3],
+            maxs: [0; 3],
+            first_leaf_surface: 1,
+            num_leaf_surfaces: 2,
+            first_leaf_brush: 0,
+            num_leaf_brushes: 0,
+        }];
+
+        assert!(matches!(
+            validate_leaf_references(&leaves, &[0, 1], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_leaf_brush_range_out_of_bounds() {
+        let leaves = [BspLeaf {
+            cluster: 0,
+            area: 0,
+            mins: [0; 3],
+            maxs: [0; 3],
+            first_leaf_surface: 0,
+            num_leaf_surfaces: 0,
+            first_leaf_brush: 0,
+            num_leaf_brushes: 2,
+        }];
+
+        assert!(matches!(
+            validate_leaf_references(&leaves, &[], &[0]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_negative_leaf_surface_range() {
+        let leaves = [BspLeaf {
+            cluster: 0,
+            area: 0,
+            mins: [0; 3],
+            maxs: [0; 3],
+            first_leaf_surface: -1,
+            num_leaf_surfaces: 0,
+            first_leaf_brush: 0,
+            num_leaf_brushes: 0,
+        }];
+
+        assert!(matches!(
+            validate_leaf_references(&leaves, &[], &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn permits_empty_leaf_ranges_at_array_end() {
+        let leaves = [BspLeaf {
+            cluster: 0,
+            area: 0,
+            mins: [0; 3],
+            maxs: [0; 3],
+            first_leaf_surface: 2,
+            num_leaf_surfaces: 0,
+            first_leaf_brush: 1,
+            num_leaf_brushes: 0,
+        }];
+
+        assert!(validate_leaf_references(&leaves, &[0, 1], &[0]).is_ok());
+    }
+    #[test]
+    fn validates_node_children_as_nodes_and_leaves() {
+        let nodes = [
+            BspNode {
+                plane: 0,
+                children: [1, -1],
+                mins: [0; 3],
+                maxs: [0; 3],
+            },
+            BspNode {
+                plane: 0,
+                children: [-1, -2],
+                mins: [0; 3],
+                maxs: [0; 3],
+            },
+        ];
+
+        let leaves = [
+            BspLeaf {
+                cluster: 0,
+                area: 0,
+                mins: [0; 3],
+                maxs: [0; 3],
+                first_leaf_surface: 0,
+                num_leaf_surfaces: 0,
+                first_leaf_brush: 0,
+                num_leaf_brushes: 0,
+            },
+            BspLeaf {
+                cluster: 1,
+                area: 0,
+                mins: [0; 3],
+                maxs: [0; 3],
+                first_leaf_surface: 0,
+                num_leaf_surfaces: 0,
+                first_leaf_brush: 0,
+                num_leaf_brushes: 0,
+            },
+        ];
+
+        assert!(validate_node_children(&nodes, &leaves).is_ok());
+    }
+
+    #[test]
+    fn rejects_node_child_out_of_range() {
+        let nodes = [BspNode {
+            plane: 0,
+            children: [1, 0],
+            mins: [0; 3],
+            maxs: [0; 3],
+        }];
+
+        assert!(matches!(
+            validate_node_children(&nodes, &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_leaf_child_out_of_range() {
+        let nodes = [BspNode {
+            plane: 0,
+            children: [-1, 0],
+            mins: [0; 3],
+            maxs: [0; 3],
+        }];
+
+        assert!(matches!(
+            validate_node_children(&nodes, &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn safely_rejects_minimum_i32_leaf_child() {
+        let nodes = [BspNode {
+            plane: 0,
+            children: [i32::MIN, 0],
+            mins: [0; 3],
+            maxs: [0; 3],
+        }];
+
+        assert!(matches!(
+            validate_node_children(&nodes, &[]),
+            Err(BspError::Bad(_))
+        ));
+    }
     #[test]
     fn validates_brush_side_references() {
         let sides = [BspBrushSide {

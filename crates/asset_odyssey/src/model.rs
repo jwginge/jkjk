@@ -105,6 +105,7 @@ pub struct MeshIr {
     pub normals: Vec<[f32; 3]>,
     pub uv1: Vec<[f32; 2]>,
     pub uv2: Vec<[f32; 2]>,
+    pub colours: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     /// Diffuse texture resref, lowercase; `None` when the model names none.
     pub texture: Option<String>,
@@ -570,6 +571,7 @@ impl ModelIr {
             normals: mesh.normals.clone(),
             uv1: mesh.uv1.clone(),
             uv2: mesh.uv2.clone(),
+            colours: Vec::new(),
             indices: mesh
                 .faces
                 .iter()
